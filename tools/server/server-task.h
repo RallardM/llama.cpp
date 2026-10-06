@@ -26,6 +26,29 @@ enum server_task_type {
     SERVER_TASK_TYPE_SLOT_ERASE,
     SERVER_TASK_TYPE_GET_LORA,
     SERVER_TASK_TYPE_SET_LORA,
+    SERVER_TASK_TYPE_DECISION,
+};
+
+struct decision_request {
+    std::string model;
+    std::string instructions;
+    common_json schema;
+    std::vector<std::string> contexts;
+    std::string mode = "auto";
+    size_t tree_max = 128;
+    bool cache_prompt = true;
+};
+
+struct server_task_result_decision : server_task_result {
+    std::string model;
+    decision_request request;
+    common_json result_json;
+
+    json to_json() override {
+        json j = result_json;
+        j["id"] = std::to_string(id);
+        return j;
+    }
 };
 
 // TODO: change this to more generic "response_format" to replace the "format_response_*" in server-common
@@ -167,6 +190,9 @@ struct server_task {
 
     // used by SERVER_TASK_TYPE_SET_LORA
     std::map<int, float> set_lora; // mapping adapter ID -> scale
+
+    // used by SERVER_TASK_TYPE_DECISION
+    decision_request decision;
 
     server_task() = default;
 

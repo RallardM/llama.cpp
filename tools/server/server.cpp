@@ -7,6 +7,7 @@
 #include "arg.h"
 #include "build-info.h"
 #include "common.h"
+#include "decision-engine.h"
 #include "fit.h"
 #include "llama.h"
 #include "log.h"
@@ -160,6 +161,7 @@ int main(int argc, char ** argv) {
         routes.post_lora_adapters          = models_routes->proxy_post;
         routes.get_slots                   = models_routes->proxy_get;
         routes.post_slots                  = models_routes->proxy_post;
+        routes.post_decision               = models_routes->proxy_post;
 
         // custom routes for router
         routes.get_props                   = models_routes->get_router_props;
@@ -204,6 +206,12 @@ int main(int argc, char ** argv) {
     // Save & load slots
     ctx_http.get ("/slots",                    ex_wrapper(routes.get_slots));
     ctx_http.post("/slots/:id_slot",           ex_wrapper(routes.post_slots));
+    // Parallel decision endpoint
+    ctx_http.post("/decision",                 ex_wrapper(routes.post_decision));
+    ctx_http.post("/v1/decision",              ex_wrapper(routes.post_decision));
+    // Step 8: Native gate endpoint
+    ctx_http.get("/v1/gate",                   ex_wrapper(routes.get_gate));
+    ctx_http.post("/v1/gate",                  ex_wrapper(routes.post_gate));
     // CORS proxy (EXPERIMENTAL, only used by the Web UI for MCP)
     if (params.webui_mcp_proxy) {
         SRV_WRN("%s", "-----------------\n");

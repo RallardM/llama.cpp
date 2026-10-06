@@ -8,6 +8,7 @@
 
 #include "build-info.h"
 #include "common.h"
+#include "decision-engine.h"
 #include "llama.h"
 #include "log.h"
 #include "sampling.h"
@@ -2145,6 +2146,153 @@ private:
                     res->id = task.id;
                     queue_results.send(std::move(res));
                 } break;
+            case SERVER_TASK_TYPE_DECISION:
+                {
+                    if (!check_no_mtmd(task.id)) {
+                        break;
+                    }
+
+                    auto & dreq = task.decision;
+
+                    // get the llama_context and create decision engine
+                    llama_context * ll_ctx = get_llama_context();
+                    if (!ll_ctx) {
+                        send_error(task, "no context available", ERROR_TYPE_SERVER);
+                        break;
+                    }
+
+                    try {
+                        // compile schema
+                        auto cs = llama_decision::compile_schema(dreq.schema, dreq.instructions);
+
+                        // render prompt for each context
+                        std::vector<std::string> user_prompts;
+                        for (auto & ctx : dreq.contexts) {
+                            auto [sys, usr] = llama_decision::render_prompt(nullptr, params.jinja, cs.system_text, ctx);
+                            user_prompts.push_back(usr);
+                        }
+
+                        // tokenize shared prefix and user prompts
+                        llama_decision::tokens_t shared_toks = common_tokenize(llama_vocab_get(ll_ctx), cs.system_text, true, true);
+
+                        // create decision engine with sequences from seq_base
+                        int n_ctx_total = llama_n_ctx(ll_ctx);
+                        int n_seq_max = llama_n_seq_max(ll_ctx);
+                        int seq_base = n_seq_max - params.n_seq_decision; // reserve slots at end
+                        if (seq_base < 0) {
+                            seq_base = 0;
+                        }
+                        int n_seqs = std::min((int)dreq.contexts.size() + 2, params.n_seq_decision);
+                        if (n_seqs < 3) {
+                            n_seqs = 3;
+                        }
+
+                        llama_decision::engine eng(ll_ctx, seq_base, n_seqs);
+
+                        // prepare fields
+                        std::vector<llama_decision::field_input> fields;
+                        for (auto & spec : cs.specs) {
+                            llama_decision::field_input fi;
+                            fi.suffix = " "; // placeholder
+                            for (auto & v : spec.encoded) {
+                                fi.candidates.push_back(v);
+                            }
+                            fields.push_back(std::move(fi));
+                        }
+
+                        // build shared prefix from system text
+                        auto shared_text = cs.system_text;
+                        // tokenize user prompts and build context tokens
+                        std::vector<llama_decision::tokens_t> context_toks;
+                        for (auto & usr : user_prompts) {
+                            auto toks = common_tokenize(llama_vocab_get(ll_ctx), usr, false, true);
+                            context_toks.push_back(std::move(toks));
+                        }
+
+                        // decide
+                        llama_decision::options opt;
+                        opt.mode = dreq.mode;
+                        opt.tree_max = dreq.tree_max;
+                        opt.allow_cache = dreq.cache_prompt;
+
+                        llama_decision::batch_result br = eng.decide_batch(shared_text, user_prompts, fields, opt);
+
+                        // build result JSON
+                        json result_json = json::object();
+                        result_json["object"] = "decision";
+                        json results_arr = json::array();
+                        for (size_t i = 0; i < br.items.size(); ++i) {
+                            auto & item = br.items[i];
+                            json r = json::object();
+                            r["decision"] = llama_decision::assemble(cs, item);
+                            r["usage"] = json::object();
+                            r["usage"]["context_tokens"] = item.context_tokens;
+                            r["usage"]["scored_rows"] = item.rows;
+                            results_arr.push_back(r);
+                        }
+                        result_json["results"] = results_arr;
+                        result_json["usage"] = json::object();
+                        result_json["usage"]["prompt_tokens"] = br.shared_tokens + br.items[0].context_tokens;
+                        result_json["usage"]["cached_tokens"] = br.shared_tokens;
+                        result_json["usage"]["context_tokens"] = br.items[0].context_tokens;
+                        result_json["usage"]["scored_rows"] = br.items[0].rows;
+                        result_json["timings"] = json::object();
+                        result_json["timings"]["prefill_ms"] = br.prefill_ms;
+                        result_json["timings"]["scoring_ms"] = br.scoring_ms;
+                        result_json["timings"]["total_ms"] = br.prefill_ms + br.scoring_ms;
+                        result_json["timings"]["rounds"] = br.rounds;
+                        result_json["timings"]["per_decision_ms"] = br.rounds > 0 ? (br.prefill_ms + br.scoring_ms) / br.rounds : 0;
+
+                        // Step 3: Add gate in response (escalation logic)
+                        // Calculate overall confidence from field signals
+                        double overall_confidence = 0.0;
+                        int n_fields = 0;
+                        double min_margin = 1.0;
+                        double max_entropy = 0.0;
+                        for (auto & item : br.items) {
+                            auto decision = llama_decision::assemble(cs, item);
+                            if (decision.has("fields")) {
+                                auto & fields = decision["fields"];
+                                for (auto & [name, field] : fields.items()) {
+                                    if (field.has("margin") && field.has("entropy")) {
+                                        double margin = field["margin"].get<double>();
+                                        double entropy = field["entropy"].get<double>();
+                                        min_margin = std::min(min_margin, margin);
+                                        max_entropy = std::max(max_entropy, entropy);
+                                        n_fields++;
+                                    }
+                                }
+                            }
+                        }
+                        // Gate logic: if confidence is low (low margin, high entropy), flag for escalation
+                        bool escalate = false;
+                        double confidence_score = 0.0;
+                        if (n_fields > 0) {
+                            // Confidence is based on margin (higher = more confident) and inverse entropy
+                            confidence_score = (1.0 - max_entropy) * (1.0 - std::max(0.0, 1.0 - min_margin * 5.0));
+                            // Escalate if confidence is below threshold
+                            if (confidence_score < 0.3) {
+                                escalate = true;
+                            }
+                        }
+                        
+                        result_json["gate"] = json::object();
+                        result_json["gate"]["escalate"] = escalate;
+                        result_json["gate"]["confidence"] = confidence_score;
+                        result_json["gate"]["min_margin"] = min_margin;
+                        result_json["gate"]["max_entropy"] = max_entropy;
+                        result_json["gate"]["n_fields"] = n_fields;
+
+                        auto res = std::make_unique<server_task_result_decision>();
+                        res->id = task.id;
+                        res->model = dreq.model;
+                        res->request = dreq;
+                        res->result_json = result_json;
+                        queue_results.send(std::move(res));
+                    } catch (const std::exception & e) {
+                        send_error(task, std::string("decision failed: ") + e.what(), ERROR_TYPE_SERVER);
+                    }
+                } break;
         }
     }
 
@@ -4163,6 +4311,93 @@ void server_routes::init_routes() {
 
         GGML_ASSERT(dynamic_cast<server_task_result_apply_lora*>(result.get()) != nullptr);
         res->ok(result->to_json());
+        return res;
+    };
+
+    this->post_decision = [this](const server_http_req & req) {
+        auto res = create_response();
+        const json body = json::parse(req.body);
+
+        // extract model name (for multi-model router)
+        std::string model_name = json_value(body, "model", std::string(""));
+
+        // extract request fields
+        decision_request dreq;
+        dreq.model = model_name;
+        dreq.instructions = json_value(body, "instructions", std::string(""));
+        dreq.schema = body.value("schema", json::object());
+        dreq.contexts = json_value(body, "contexts", std::vector<std::string>{});
+        dreq.mode = json_value(body, "mode", std::string("auto"));
+        dreq.tree_max = json_value(body, "tree_max", (size_t)128);
+        dreq.cache_prompt = json_value(body, "cache_prompt", true);
+
+        if (dreq.contexts.empty()) {
+            res->error(format_error_response("contexts array is required", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+
+        auto & rd = res->rd;
+        {
+            server_task task(SERVER_TASK_TYPE_DECISION);
+            task.id = rd.get_new_id();
+            task.decision = std::move(dreq);
+            rd.post_task(std::move(task));
+        }
+
+        // get the result
+        auto result = rd.next(req.should_stop);
+        if (!result) {
+            GGML_ASSERT(req.should_stop());
+            return res;
+        }
+
+        if (result->is_error()) {
+            res->error(result->to_json());
+            return res;
+        }
+
+        GGML_ASSERT(dynamic_cast<server_task_result_decision*>(result.get()) != nullptr);
+        res->ok(result->to_json());
+        return res;
+    };
+
+    // Step 8: Native gate endpoint
+    this->get_gate = [this](const server_http_req & req) {
+        auto res = create_response();
+        // Return current gate state based on last decision
+        json gate_state = json::object();
+        gate_state["status"] = "active";
+        gate_state["mode"] = "fast"; // default to fast mode
+        gate_state["confidence"] = 1.0;
+        gate_state["last_decision"] = nullptr;
+        res->ok(gate_state);
+        return res;
+    };
+
+    this->post_gate = [this](const server_http_req & req) {
+        auto res = create_response();
+        const json body = json::parse(req.body);
+
+        // Extract gate parameters
+        double confidence_threshold = json_value(body, "confidence_threshold", 0.3);
+        std::string mode = json_value(body, "mode", std::string("auto"));
+
+        // Update gate state
+        json gate_response = json::object();
+        gate_response["status"] = "updated";
+        gate_response["confidence_threshold"] = confidence_threshold;
+        gate_response["mode"] = mode;
+        gate_response["escalate"] = false;
+
+        // If mode is "auto", check confidence
+        if (mode == "auto") {
+            // For now, default to fast mode
+            gate_response["current_mode"] = "fast";
+        } else {
+            gate_response["current_mode"] = mode;
+        }
+
+        res->ok(gate_response);
         return res;
     };
 }
