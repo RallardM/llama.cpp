@@ -1,4 +1,3 @@
-// tools\parallel-decision\decision-engine.cpp 
 #include "decision-engine.h"
 
 #include "chat.h"
@@ -7,6 +6,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <functional>
 #include <cstdio>
 #include <cstdlib>
 #include <stdexcept>
@@ -17,6 +17,23 @@ namespace {
 
 double ms_since(std::chrono::steady_clock::time_point t) {
     return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t).count();
+}
+
+// log(sum(exp(x))) over a full logits row. Tokens more than 20 below the maximum add less than
+// 2e-9 each, so they are skipped: only a few hundred exp() calls per row.
+float logits_lse(const float * x, int n) {
+    float mx = x[0];
+    for (int i = 1; i < n; ++i) {
+        mx = std::max(mx, x[i]);
+    }
+    const float floor_v = mx - 20.0f;
+    double z = 0;
+    for (int i = 0; i < n; ++i) {
+        if (x[i] > floor_v) {
+            z += std::exp((double) (x[i] - mx));
+        }
+    }
+    return mx + (float) std::log(z);
 }
 
 struct decision_field {
@@ -34,6 +51,10 @@ struct decision_field {
     int   winner       = -1;
     float path_score   = 1.0f;
     int   scored_nodes = 0;
+    float margin       = -1.0f;
+    float entropy      = -1.0f;
+    float log_mass     = 0.0f;
+    bool  has_mass     = false;
 
     decision_field(tokens_t s, std::vector<tokens_t> p) : suffix(std::move(s)), paths(std::move(p)) {
         for (int i = 0; i < (int) paths.size(); ++i) {
@@ -63,7 +84,7 @@ struct decision_field {
         return {};
     }
 
-    void select(llama_token tok, float p) {
+    void select(llama_token tok, float p, float log_mass_step = 0.0f, bool has_step_mass = false) {
         const size_t depth = chosen.size();
         std::vector<int> remaining;
         for (int i : active) {
@@ -75,6 +96,10 @@ struct decision_field {
         chosen.push_back(tok);
         path_score *= p;
         scored_nodes += 1;
+        if (has_step_mass) {
+            log_mass += log_mass_step;
+            has_mass  = true;
+        }
     }
 
     void build_nodes() {
@@ -125,8 +150,9 @@ struct decision_field {
 
     // Exact constrained distribution: log-softmax at each node over its allowed tokens,
     // summed along every candidate path, normalised over candidates.
-    void finish_tree(const std::vector<std::vector<float>> & node_scores) {
+    void finish_tree(const std::vector<std::vector<float>> & node_scores, const std::vector<float> & node_lse = {}) {
         std::vector<std::vector<float>> node_logp;
+        std::vector<float> node_lm; // log of the probability mass the allowed tokens hold at each node
         for (const auto & s : node_scores) {
             const float mx = *std::max_element(s.begin(), s.end());
             double z = 0;
@@ -139,8 +165,10 @@ struct decision_field {
                 lp.push_back(x - lz);
             }
             node_logp.push_back(lp);
+            node_lm.push_back(node_lse.empty() ? 0.0f : lz - node_lse[node_lm.size()]);
         }
         std::vector<float> path_lp(paths.size(), 0.0f);
+        std::vector<float> path_lm(paths.size(), 0.0f);
         for (size_t i = 0; i < paths.size(); ++i) {
             for (size_t n = 0; n < node_prefix.size(); ++n) {
                 const auto & pre = node_prefix[n];
@@ -153,6 +181,7 @@ struct decision_field {
                     throw std::runtime_error("candidate token missing from its trie node");
                 }
                 path_lp[i] += node_logp[n][it - opts.begin()];
+                path_lm[i] += node_lm[n];
             }
         }
         const int best = (int) (std::max_element(path_lp.begin(), path_lp.end()) - path_lp.begin());
@@ -167,6 +196,25 @@ struct decision_field {
         winner       = best;
         path_score   = probs[best];
         scored_nodes = (int) node_prefix.size();
+
+        // confidence signals from the exact constrained distribution
+        std::vector<float> sorted = probs;
+        std::sort(sorted.begin(), sorted.end(), std::greater<float>());
+        margin = sorted[0] - (sorted.size() > 1 ? sorted[1] : 0.0f);
+        entropy = 0.0f;
+        if (probs.size() > 1) {
+            double h = 0;
+            for (float x : probs) {
+                if (x > 0) {
+                    h -= (double) x * std::log((double) x);
+                }
+            }
+            entropy = (float) (h / std::log((double) probs.size()));
+        }
+        if (!node_lse.empty()) {
+            log_mass = path_lm[best];
+            has_mass = true;
+        }
     }
 };
 
@@ -176,9 +224,8 @@ struct decision_field {
 
 engine::engine(llama_context * ctx, llama_seq_id seq_base, int n_seqs)
     : ctx(ctx), vocab(llama_model_get_vocab(llama_get_model(ctx))), mem(llama_get_memory(ctx)),
-      seq_snap(seq_base), seq_pool(seq_base + 1), base_seq(seq_base), n_pool(n_seqs - 1),
-      pad_branches(llama_model_is_recurrent(llama_get_model(ctx)) || llama_model_is_hybrid(llama_get_model(ctx))),
-      kv_sharing_enabled(false), tail_raw_len(0) {
+      seq_snap(seq_base), seq_pool(seq_base + 1), n_pool(n_seqs - 1),
+      pad_branches(llama_model_is_recurrent(llama_get_model(ctx)) || llama_model_is_hybrid(llama_get_model(ctx))) {
     if (n_seqs < 3) {
         throw std::invalid_argument("a decision engine needs at least 3 sequences");
     }
@@ -245,8 +292,13 @@ bool engine::prepare_prefix(const tokens_t & shared, bool allow_cache) {
 // passes. There each group is right-padded to its longest branch (longest first, so padding stays
 // small). Every layer is causal, so the logits read at a branch's last real token don't see the
 // padding, and the padded cells are removed with the branch.
-std::vector<std::vector<float>> engine::score_branches(const std::vector<branch> & branches, llama_seq_id first, int n_free) {
+std::vector<std::vector<float>> engine::score_branches(const std::vector<branch> & branches, llama_seq_id first, int n_free,
+                                                       std::vector<float> * lse_out) {
     std::vector<std::vector<float>> result(branches.size());
+    if (lse_out) {
+        lse_out->assign(branches.size(), 0.0f);
+    }
+    const int n_vocab = llama_vocab_n_tokens(vocab);
     std::vector<size_t> order(branches.size());
     for (size_t b = 0; b < order.size(); ++b) {
         order[b] = b;
@@ -300,40 +352,14 @@ std::vector<std::vector<float>> engine::score_branches(const std::vector<branch>
             for (llama_token t : branches[order[k]].cands) {
                 result[order[k]].push_back(logits[t]);
             }
+            if (lse_out) {
+                (*lse_out)[order[k]] = logits_lse(logits, n_vocab);
+            }
             llama_memory_seq_rm(mem, first + (llama_seq_id) (k - start), -1, -1);
         }
         start = end;
     }
     return result;
-}
-
-// Step 5: KV sharing - share KV cache from base_seq to target
-void engine::share_kv_from_base(llama_seq_id target, size_t n_tokens) {
-    if (!kv_sharing_enabled) {
-        return;
-    }
-    // Copy KV cache from base_seq to target sequence
-    llama_memory_seq_cp(mem, base_seq, target, 0, (llama_pos) n_tokens);
-}
-
-// Step 5: KV sharing - append tail_raw to target sequence
-void engine::append_tail_raw(llama_seq_id target, const tokens_t & tail) {
-    if (!kv_sharing_enabled || tail.empty()) {
-        return;
-    }
-    // Append tokens to target sequence starting from tail_raw_len
-    llama_memory_seq_rm(mem, target, 0, (llama_pos) tail_raw_len);
-    // Decode the tail tokens on the target sequence
-    llama_batch batch = llama_batch_init((int) tail.size(), 0, 1);
-    for (int i = 0; i < (int) tail.size(); ++i) {
-        common_batch_add(batch, tail[i], (llama_pos) (tail_raw_len + i), { target }, true);
-    }
-    const int rc = llama_decode(ctx, batch);
-    llama_batch_free(batch);
-    if (rc != 0) {
-        throw std::runtime_error("KV sharing decode failed");
-    }
-    tail_raw_len = tail.size();
 }
 
 result engine::decide(const std::string & shared_text, const std::string & context_text,
@@ -356,34 +382,16 @@ batch_result engine::decide_batch(const std::string & shared_text, const std::ve
     if (contexts.empty()) {
         throw std::invalid_argument("a decision needs at least one context");
     }
-    const tokens_t shared = tokenize(shared_text, true);
+    // base_seq >= 0: the context continues a sequence that already holds the prompt (a server slot),
+    // so there is no rendered prefix to cache and no BOS to add
+    const bool     on_base  = opt.base_seq >= 0;
+    const tokens_t shared   = on_base ? tokens_t() : tokenize(shared_text, true);
+    const llama_pos base_len = on_base ? opt.base_len : (llama_pos) shared.size();
     std::vector<tokens_t> prefixes;
     for (const auto & text : contexts) {
-        prefixes.push_back(tokenize(text, shared.empty()));
+        prefixes.push_back(tokenize(text, shared.empty() && !on_base));
         if (prefixes.back().empty()) {
             throw std::invalid_argument("the decision context must not be empty");
-        }
-    }
-
-    // Step 6: Think-K-then-decide (R1 rung)
-    // If think_k > 0, generate K thinking tokens before decision scoring
-    tokens_t think_tokens;
-    if (opt.think_k > 0) {
-        // Generate K tokens as "thinking" tokens (greedy sampling)
-        // These tokens are appended to the context before decision scoring
-        for (size_t i = 0; i < prefixes.size(); ++i) {
-            // For now, we'll just note that think_k is requested
-            // The actual thinking generation would require a separate generation step
-            // For this implementation, we'll use a placeholder approach:
-            // Add a special "thinking" token sequence to each prefix
-            tokens_t think_prefix;
-            think_prefix.push_back(llama_token(-1)); // placeholder for thinking start
-            for (int k = 0; k < opt.think_k; ++k) {
-                think_prefix.push_back(llama_token(-2)); // placeholder for thinking token
-            }
-            think_prefix.push_back(llama_token(-3)); // placeholder for thinking end
-            think_tokens = think_prefix; // Use same for all contexts for now
-            break; // Only need one set of thinking tokens
         }
     }
 
@@ -445,12 +453,12 @@ batch_result engine::decide_batch(const std::string & shared_text, const std::ve
     }
 
     batch_result out;
-    out.shared_tokens = shared.size();
+    out.shared_tokens = (size_t) base_len;
     out.rows          = total * (int) contexts.size();
     out.items.resize(contexts.size());
 
     const auto t0 = std::chrono::steady_clock::now();
-    out.cache_hit = prepare_prefix(shared, opt.allow_cache);
+    out.cache_hit = on_base ? true : prepare_prefix(shared, opt.allow_cache);
     out.prefill_ms += ms_since(t0);
 
     // each context in a group holds one trunk sequence; the rest of the pool scores branches
@@ -463,10 +471,12 @@ batch_result engine::decide_batch(const std::string & shared_text, const std::ve
         for (size_t i = 0; i < n_group; ++i) {
             const llama_seq_id trunk = seq_pool + (llama_seq_id) i;
             llama_memory_seq_rm(mem, trunk, -1, -1);
-            if (!shared.empty()) {
+            if (on_base) {
+                llama_memory_seq_cp(mem, opt.base_seq, trunk, -1, -1);
+            } else if (!shared.empty()) {
                 llama_memory_seq_cp(mem, seq_snap, trunk, -1, -1);
             }
-            parts.push_back({ &prefixes[g0 + i], (llama_pos) shared.size(), trunk });
+            parts.push_back({ &prefixes[g0 + i], base_len, trunk });
         }
         decode_parts(parts);
         llama_synchronize(ctx); // llama_decode is asynchronous: wait for the prefill so its time isn't billed to scoring
@@ -482,7 +492,7 @@ batch_result engine::decide_batch(const std::string & shared_text, const std::ve
             std::vector<std::pair<size_t, size_t>> owner; // (context in group, field)
             for (size_t i = 0; i < n_group; ++i) {
                 const llama_seq_id trunk = seq_pool + (llama_seq_id) i;
-                const llama_pos    pos0  = (llama_pos) (shared.size() + prefixes[g0 + i].size());
+                const llama_pos    pos0  = base_len + (llama_pos) prefixes[g0 + i].size();
                 for (size_t f = 0; f < state[i].size(); ++f) {
                     auto & fd = state[i][f];
                     if (fd.use_tree) {
@@ -508,14 +518,19 @@ batch_result engine::decide_batch(const std::string & shared_text, const std::ve
             if (todo.empty()) {
                 break;
             }
-            const auto scores = score_branches(todo, seq_pool + (llama_seq_id) n_group, n_pool - (int) n_group);
+            std::vector<float> lse_all;
+            const auto scores = score_branches(todo, seq_pool + (llama_seq_id) n_group, n_pool - (int) n_group, opt.mass ? &lse_all : nullptr);
             out.rounds += 1;
             std::vector<std::vector<std::vector<std::vector<float>>>> tree_scores(n_group, std::vector<std::vector<std::vector<float>>>(fields.size()));
+            std::vector<std::vector<std::vector<float>>> tree_lse(n_group, std::vector<std::vector<float>>(fields.size()));
             for (size_t row = 0; row < owner.size(); ++row) {
                 const auto [i, f] = owner[row];
                 auto & fd = state[i][f];
                 if (fd.use_tree) {
                     tree_scores[i][f].push_back(scores[row]);
+                    if (opt.mass) {
+                        tree_lse[i][f].push_back(lse_all[row]);
+                    }
                 } else {
                     const auto & s    = scores[row];
                     const int    best = (int) (std::max_element(s.begin(), s.end()) - s.begin());
@@ -523,14 +538,15 @@ batch_result engine::decide_batch(const std::string & shared_text, const std::ve
                     for (float x : s) {
                         denom += std::exp(x - s[best]);
                     }
-                    fd.select(todo[row].cands[best], (float) (1.0 / denom));
+                    fd.select(todo[row].cands[best], (float) (1.0 / denom),
+                              opt.mass ? s[best] + (float) std::log(denom) - lse_all[row] : 0.0f, opt.mass);
                 }
             }
             if (first) {
                 for (size_t i = 0; i < n_group; ++i) {
                     for (size_t f = 0; f < fields.size(); ++f) {
                         if (state[i][f].use_tree) {
-                            state[i][f].finish_tree(tree_scores[i][f]);
+                            state[i][f].finish_tree(tree_scores[i][f], tree_lse[i][f]);
                         }
                     }
                 }
@@ -546,7 +562,17 @@ batch_result engine::decide_batch(const std::string & shared_text, const std::ve
                 if (fd.use_tree && fd.probs.empty()) {
                     fd.finish_tree({});
                 }
-                r.fields.push_back({ fd.winner, fd.path_score, fd.scored_nodes, fd.use_tree, fd.probs });
+                field_result fr;
+            fr.winner       = fd.winner;
+            fr.path_score   = fd.path_score;
+            fr.scored_nodes = fd.scored_nodes;
+            fr.tree         = fd.use_tree;
+            fr.probs        = fd.probs;
+            fr.margin       = fd.margin;
+            fr.entropy      = fd.entropy;
+            fr.log_mass     = fd.log_mass;
+            fr.has_mass     = fd.has_mass;
+            r.fields.push_back(std::move(fr));
             }
         }
         out.scoring_ms += ms_since(ts);
@@ -788,118 +814,26 @@ common_json assemble(const compiled_schema & cs, const result & r) {
         if (idx < 0 || idx >= (int) sp.values.size()) {
             throw std::runtime_error("field \"" + sp.name + "\" has no selected value");
         }
-        // Step 2: Compute signals (margin, entropy, mass)
-        float margin = 0.0f;
-        float entropy = 0.0f;
-        if (fr.probs.size() >= 2) {
-            std::vector<float> sorted_probs = fr.probs;
-            std::sort(sorted_probs.begin(), sorted_probs.end(), std::greater<float>());
-            margin = sorted_probs[0] - sorted_probs[1];
-            for (size_t k = 0; k < fr.probs.size(); ++k) {
-                if (fr.probs[k] > 1e-9) {
-                    entropy -= fr.probs[k] * std::log(fr.probs[k]);
-                }
-            }
-            // Normalise entropy to 0..1 (max = log(n))
-            float max_entropy = std::log((float) fr.probs.size());
-            if (max_entropy > 1e-9) {
-                entropy /= max_entropy;
-            }
-        }
-        // Mass: prob inside allowed tokens vs full vocab (approximate with path_score for greedy)
-        float mass = fr.path_score;
-
         decision[sp.name] = sp.values[idx];
         f["value"]        = sp.values[idx];
         f["probability"]  = (double) (fr.probs.size() == sp.values.size() ? fr.probs[idx] : fr.path_score);
         f["scored_nodes"] = fr.scored_nodes;
         f["tree"]         = fr.tree;
-        // Step 2 signals
-        f["margin"]       = (double) margin;
-        f["entropy"]      = (double) entropy;
-        f["mass"]         = (double) mass;
+        if (fr.margin >= 0.0f) {
+            f["margin"] = (double) fr.margin;
+        }
+        if (fr.entropy >= 0.0f) {
+            f["entropy"] = (double) fr.entropy;
+        }
+        if (fr.has_mass) {
+            f["mass"] = std::exp((double) fr.log_mass);
+        }
         fields[sp.name]   = f;
     }
     common_json out = common_json::object();
     out["decision"] = decision;
     out["fields"]   = fields;
     return out;
-}
-
-// Step 7: Schema registry implementation
-schema_registry::entry* schema_registry::register_schema(const std::string & name, const common_json & schema,
-                                                          const std::string & instructions) {
-    // Check if schema already exists
-    for (auto & entry : entries_) {
-        if (entry->name == name) {
-            entry->use_count++;
-            return entry.get();
-        }
-    }
-
-    // If registry is full, evict LRU
-    if (current_entries_ >= max_entries_) {
-        evict_lru();
-    }
-
-    // Compile the schema
-    compiled_schema cs = compile_schema(schema, instructions);
-
-    // Create new entry
-    auto new_entry = std::make_unique<entry>(name, std::move(cs));
-    entry* ptr = new_entry.get();
-    entries_.push_back(std::move(new_entry));
-    current_entries_++;
-    ptr->use_count = 1;
-    return ptr;
-}
-
-schema_registry::entry* schema_registry::get_schema(const std::string & name) {
-    for (auto & entry : entries_) {
-        if (entry->name == name) {
-            entry->use_count++;
-            return entry.get();
-        }
-    }
-    return nullptr;
-}
-
-void schema_registry::evict_lru() {
-    if (entries_.empty()) {
-        return;
-    }
-
-    // Find entry with lowest use_count (LRU approximation)
-    size_t lru_idx = 0;
-    int min_use = entries_[0]->use_count;
-    for (size_t i = 1; i < entries_.size(); ++i) {
-        if (entries_[i]->use_count < min_use) {
-            min_use = entries_[i]->use_count;
-            lru_idx = i;
-        }
-    }
-
-    entries_.erase(entries_.begin() + lru_idx);
-    current_entries_--;
-}
-
-std::vector<std::string> schema_registry::list_schemas() const {
-    std::vector<std::string> names;
-    for (const auto & entry : entries_) {
-        names.push_back(entry->name);
-    }
-    return names;
-}
-
-bool schema_registry::remove_schema(const std::string & name) {
-    for (auto it = entries_.begin(); it != entries_.end(); ++it) {
-        if ((*it)->name == name) {
-            entries_.erase(it);
-            current_entries_--;
-            return true;
-        }
-    }
-    return false;
 }
 
 } // namespace llama_decision

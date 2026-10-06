@@ -132,3 +132,15 @@ line). Environment: `DECIDE_TREE`, `DECIDE_TREE_MAX`, `DECIDE_NSEQ`, `DECIDE_SPL
 [decision-playground](https://github.com/thecodacus/decision-playground) is a browser-only playground: it talks
 straight to your llama-server, runs a decision and the same question as a chat completion side by side with live
 timers, and has a small game whose agents decide through the endpoint.
+
+## Dynamic extensions (confidence signals, gate, slot mode)
+
+Request fields added to `POST /v1/decision`:
+
+- `mass: true` also measures how much probability the allowed tokens held (one pass over the vocabulary per scored row; the gate's `min_mass` turns it on by itself).
+- `gate: { min_prob, min_margin, max_entropy, min_mass, fields? }` adds `results[i].gate = { escalate, weakest, reasons[] }`.
+- `slot: N` continues server slot N's KV instead of a rendered prefix. Each `contexts` entry is appended after the slot's tokens, with the field catalogue in front unless `catalogue: false`. The slot must be idle and non-empty.
+- `raw: true` (with `slot`) appends each context exactly as written, then `{`, with no template markup: for a slot whose prompt already asks for the JSON (for example after thinking).
+- `describe: true` returns the compiled field catalogue (`system_text`) without scoring.
+
+Per field the response now also carries `margin` (best minus runner-up probability) and `entropy` (0..1) for tree fields, and `mass` when requested.

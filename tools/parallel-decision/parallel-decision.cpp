@@ -1,4 +1,3 @@
-// tools\parallel-decision\parallel-decision.cpp
 // Parallel constrained decisions from prepared request files (see decision-engine.h).
 //
 // Protocol (compatible with llama-mojo's decide-worker and its tools/prepare_decisions.py):

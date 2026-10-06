@@ -1,4 +1,3 @@
-// tools\parallel-decision\decision-engine.h
 #pragma once
 
 // Parallel constrained decisions for finite JSON schemas, shared by llama-parallel-decision
@@ -17,7 +16,6 @@
 #include <string>
 #include <utility>
 #include <vector>
-#include <memory>
 
 struct common_chat_templates;
 
@@ -36,7 +34,9 @@ struct options {
     size_t      tree_max       = 128;
     bool        split_boundary = false;  // legacy: tokenise suffix and values separately
     bool        allow_cache    = true;   // reuse the cached static prefix when it matches
-    int         think_k        = 0;      // Step 6: think for K tokens before deciding (0 = disabled)
+    llama_seq_id base_seq      = -1;     // >= 0: decide on top of this sequence (a server slot) instead of a rendered prefix
+    llama_pos    base_len      = 0;      // tokens already held by base_seq
+    bool        mass           = false;  // also measure how much probability the allowed tokens hold (one pass over the vocabulary per scored row)
 };
 
 struct field_result {
@@ -45,10 +45,10 @@ struct field_result {
     int                scored_nodes = 0;
     bool               tree         = false;
     std::vector<float> probs;            // tree fields: probability of every allowed value
-    // Signals (Step 2)
-    float              margin         = 0.0f;   // p1 - p2: confidence gap between top 2 choices
-    float              entropy        = 0.0f;   // normalised 0..1: uncertainty of distribution
-    float              mass           = 1.0f;   // prob inside allowed tokens vs full vocab
+    float              margin       = -1.0f; // tree fields: best probability minus the runner-up (-1: unknown)
+    float              entropy      = -1.0f; // tree fields: entropy of probs, 0..1 (-1: unknown)
+    float              log_mass     = 0.0f;  // log of the probability mass the allowed tokens held along the winning path
+    bool               has_mass     = false;
 };
 
 struct result {
@@ -105,21 +105,16 @@ class engine {
     llama_context     * ctx;
     const llama_vocab * vocab;
     llama_memory_t      mem;
-    llama_seq_id        seq_snap, seq_pool, base_seq;
+    llama_seq_id        seq_snap, seq_pool;
     int                 n_pool;
     bool                pad_branches; // recurrent/hybrid model: branches in a decode need equal lengths
     tokens_t            cached;
-    // Step 5: KV sharing with base_seq and tail_raw
-    bool                kv_sharing_enabled;
-    size_t              tail_raw_len; // tokens in tail_raw
 
     tokens_t tokenize(const std::string & text, bool add_special) const;
     void     decode_parts(const std::vector<prompt_part> & parts);
     bool     prepare_prefix(const tokens_t & shared, bool allow_cache);
-    std::vector<std::vector<float>> score_branches(const std::vector<branch> & branches, llama_seq_id first, int n_free);
-    // Step 5: KV sharing helpers
-    void share_kv_from_base(llama_seq_id target, size_t n_tokens);
-    void append_tail_raw(llama_seq_id target, const tokens_t & tail);
+    std::vector<std::vector<float>> score_branches(const std::vector<branch> & branches, llama_seq_id first, int n_free,
+                                                   std::vector<float> * lse_out = nullptr);
 };
 
 // ---- schema compiler (the C++ counterpart of llama-mojo's tools/prepare_decisions.py)
@@ -152,44 +147,5 @@ std::pair<std::string, std::string> render_prompt(const common_chat_templates * 
 
 // {"decision": {...}, "fields": {...}} from the scores, applying each numeric field's aggregate.
 common_json assemble(const compiled_schema & cs, const result & r);
-
-// Step 7: Schema registry and multi-prefix cache
-class schema_registry {
-  public:
-    // Registry entry for a named schema
-    struct entry {
-        std::string              name;
-        compiled_schema          compiled;
-        std::vector<tokens_t>    prefix_cache; // cached tokenized prefixes for this schema
-        size_t                   max_cache_size;
-        int                      use_count;
-
-        entry(std::string n, compiled_schema cs, size_t max_sz = 10)
-            : name(std::move(n)), compiled(std::move(cs)), max_cache_size(max_sz), use_count(0) {}
-    };
-
-    schema_registry(size_t max_entries = 32) : max_entries_(max_entries), current_entries_(0) {}
-
-    // Register a schema with a name, return the entry pointer
-    entry* register_schema(const std::string & name, const common_json & schema,
-                           const std::string & instructions = "");
-
-    // Get a registered schema by name, return nullptr if not found
-    entry* get_schema(const std::string & name);
-
-    // Evict least recently used schema if registry is full
-    void evict_lru();
-
-    // Get all registered schema names
-    std::vector<std::string> list_schemas() const;
-
-    // Remove a schema by name
-    bool remove_schema(const std::string & name);
-
-  private:
-    std::vector<std::unique_ptr<entry>> entries_;
-    size_t max_entries_;
-    size_t current_entries_;
-};
 
 } // namespace llama_decision
