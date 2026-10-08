@@ -161,6 +161,12 @@ int llama_server(common_params & params, int argc, char ** argv) {
         }
     }
 
+    // --dynamic-jev classifies every chat request with the decision engine, which needs its sequences
+    if (params.dynamic_jev && params.n_seq_decision == 0) {
+        params.n_seq_decision = 12;
+        SRV_INF("--dynamic-jev: reserving %d decision sequences\n", params.n_seq_decision);
+    }
+
     // decision branches fork from the prompt with llama_memory_seq_cp; a unified KV cache lets
     // them share the prompt's cells instead of copying them between per-sequence streams
     if (params.n_seq_decision > 0 && !params.kv_unified) {
@@ -221,6 +227,7 @@ int llama_server(common_params & params, int argc, char ** argv) {
         // proxy handlers
         // note: routes.get_health stays the same
         routes.get_metrics                 = models_routes->proxy_get;
+        routes.get_dynamic_jev             = models_routes->proxy_get;
         routes.post_props                  = models_routes->proxy_post;
         routes.post_completions            = models_routes->proxy_post;
         routes.post_completions_oai        = models_routes->proxy_post;
@@ -260,6 +267,7 @@ int llama_server(common_params & params, int argc, char ** argv) {
     ctx_http.get ("/v1/health",                ex_wrapper(routes.get_health)); // public endpoint (no API key check)
     ctx_http.get ("/metrics",                  ex_wrapper(routes.get_metrics));
     ctx_http.get ("/props",                    ex_wrapper(routes.get_props));
+    ctx_http.get ("/dynamic-jev",              ex_wrapper(routes.get_dynamic_jev));
     ctx_http.post("/props",                    ex_wrapper(routes.post_props));
     ctx_http.get ("/models",                   ex_wrapper(routes.get_models));
     ctx_http.get ("/v1/models",                ex_wrapper(routes.get_models));

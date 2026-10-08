@@ -1,0 +1,26 @@
+{
+  "router": {
+    "schema": {
+      "difficulty": {
+        "type": "enum",
+        "choices": ["easy", "medium", "hard"],
+        "description": "How hard is the request? easy: a short direct answer, a lookup or a small edit. medium: a few steps of reasoning or a short program. hard: multi-step reasoning, a non-trivial algorithm or a competition-style problem."
+      },
+      "kind": {
+        "type": "enum",
+        "choices": ["code", "math", "science", "reading", "chat"],
+        "description": "What kind of request is it? code: write or fix a program. math: a mathematical problem. science: a science question. reading: understand or summarise a text. chat: anything else."
+      }
+    },
+    "instructions": "Classify the user's request.",
+    "max_chars": 4000,
+    "gate": { "min_prob": 0.55, "min_margin": 0.15, "min_mass": 0.2, "fields": ["difficulty"] }
+  },
+  "override_client": false,
+  "escalate_steps": 1,
+  "rungs": [
+    { "name": "R0", "when": { "difficulty": ["easy"] },   "enable_thinking": false, "system_hint": "Answer directly and concisely." },
+    { "name": "R1", "when": { "difficulty": ["medium"] }, "enable_thinking": true,  "reasoning_budget_tokens": 1024 },
+    { "name": "R2", "when": {},                           "enable_thinking": true,  "reasoning_budget_tokens": -1 }
+  ]
+}

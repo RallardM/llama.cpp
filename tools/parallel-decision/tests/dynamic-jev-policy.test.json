@@ -1,0 +1,8 @@
+{
+  "override_client": false,
+  "rungs": [
+    { "name": "R0", "when": { "difficulty": ["easy"] },   "enable_thinking": false, "max_tokens": 3, "system_hint": "Answer directly and concisely." },
+    { "name": "R1", "when": { "difficulty": ["medium"] }, "enable_thinking": true,  "reasoning_budget_tokens": 64 },
+    { "name": "R2", "when": {},                           "enable_thinking": true,  "reasoning_budget_tokens": -1 }
+  ]
+}

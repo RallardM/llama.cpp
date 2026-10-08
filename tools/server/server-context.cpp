@@ -31,6 +31,12 @@
 #include <random>
 #include <utility>
 #include <fstream>
+#include <chrono>
+#include <deque>
+#include <functional>
+#include <map>
+#include <mutex>
+#include <sstream>
 
 // fix problem with std::min and std::max
 #if defined(_WIN32)
@@ -5632,6 +5638,385 @@ json server_routes::get_model_info() const {
     return get_res_model_info(*meta);
 }
 
+// ---------------------------------------------------------------- dynamic Jev: chat auto-route
+//
+// With --dynamic-jev every /v1/chat/completions request is first classified by the decision engine
+// (a router decision on the user's request). The answer, and how sure the model was, pick a rung of
+// the policy; the rung sets the thinking level (and optionally a token cap and a system hint) on the
+// request before it reaches the normal completion path. Any failure leaves the request unchanged.
+// Policy file: --dynamic-jev-policy FILE (top-level keys replace the built-in ones).
+
+namespace {
+
+const char * const DJ_DEFAULT_POLICY = R"JSON({
+  "router": {
+    "schema": {
+      "difficulty": {"type": "enum", "choices": ["easy", "medium", "hard"],
+        "description": "How hard is the request? easy: a short direct answer, a lookup or a small edit. medium: a few steps of reasoning or a short program. hard: multi-step reasoning, a non-trivial algorithm or a competition-style problem."},
+      "kind": {"type": "enum", "choices": ["code", "math", "science", "reading", "chat"],
+        "description": "What kind of request is it? code: write or fix a program. math: a mathematical problem. science: a science question. reading: understand or summarise a text. chat: anything else."}
+    },
+    "instructions": "Classify the user's request.",
+    "max_chars": 4000,
+    "gate": {"min_prob": 0.55, "min_margin": 0.15, "min_mass": 0.2, "fields": ["difficulty"]}
+  },
+  "override_client": false,
+  "escalate_steps": 1,
+  "rungs": [
+    {"name": "R0", "when": {"difficulty": ["easy"]},   "enable_thinking": false, "system_hint": "Answer directly and concisely."},
+    {"name": "R1", "when": {"difficulty": ["medium"]}, "enable_thinking": true,  "reasoning_budget_tokens": 1024},
+    {"name": "R2", "when": {},                         "enable_thinking": true,  "reasoning_budget_tokens": -1}
+  ]
+})JSON";
+
+struct dj_state {
+    json                                    policy;
+    std::mutex                              mtx;
+    std::map<size_t, std::pair<json, json>> cache; // hash of the router text -> (decision, gate)
+    std::deque<size_t>                      order;
+    long long                               routed = 0, cache_hits = 0, failed_open = 0, skipped = 0;
+    double                                  router_ms = 0.0;
+    std::map<std::string, long long>        by_rung;
+    std::string                             last_error;
+};
+
+json dj_load_policy(const std::string & path) {
+    json pol = json::parse(DJ_DEFAULT_POLICY);
+    if (!path.empty()) {
+        std::ifstream f(path, std::ios::binary);
+        if (!f) {
+            throw std::runtime_error("--dynamic-jev-policy: cannot open " + path);
+        }
+        std::stringstream ss;
+        ss << f.rdbuf();
+        json user = json::parse(ss.str());
+        if (!user.is_object()) {
+            throw std::runtime_error("--dynamic-jev-policy: the file must hold a JSON object");
+        }
+        for (const auto & e : user.items()) {
+            pol[e.key()] = e.value();
+        }
+    }
+    if (!pol.contains("router") || !pol.at("router").is_object() || !pol.at("router").contains("schema")) {
+        throw std::runtime_error("--dynamic-jev-policy: \"router\" needs a \"schema\"");
+    }
+    if (!pol.contains("rungs") || !pol.at("rungs").is_array() || pol.at("rungs").size() == 0) {
+        throw std::runtime_error("--dynamic-jev-policy: \"rungs\" must be a non-empty array");
+    }
+    // the router schema must compile now, so a typo fails at startup and not on the first request
+    llama_decision::compile_schema(pol.at("router").at("schema"), "");
+    return pol;
+}
+
+std::string dj_message_text(const json & content) {
+    if (content.is_string()) {
+        return content.get<std::string>();
+    }
+    std::string out;
+    if (content.is_array()) {
+        for (const auto & part : content) {
+            if (part.is_object() && part.value("type", std::string()) == "text") {
+                out += part.value("text", std::string());
+                out += "\n";
+            }
+        }
+    }
+    return out;
+}
+
+// the last user message that holds text
+std::string dj_last_user_text(const json & body) {
+    std::string last;
+    if (!body.contains("messages") || !body.at("messages").is_array()) {
+        return last;
+    }
+    for (const auto & m : body.at("messages")) {
+        if (m.is_object() && m.value("role", std::string()) == "user" && m.contains("content")) {
+            const std::string t = dj_message_text(m.at("content"));
+            if (!t.empty()) {
+                last = t;
+            }
+        }
+    }
+    return last;
+}
+
+// keep the beginning (the task) and the end (the format rules) of a long request, cut on UTF-8 boundaries
+std::string dj_clip(const std::string & s, size_t max_chars) {
+    if (max_chars == 0 || s.size() <= max_chars) {
+        return s;
+    }
+    size_t head = max_chars * 2 / 3;
+    size_t tail = max_chars - head;
+    while (head > 0 && (static_cast<unsigned char>(s[head]) & 0xC0) == 0x80) {
+        --head;
+    }
+    size_t from = s.size() - tail;
+    while (from < s.size() && (static_cast<unsigned char>(s[from]) & 0xC0) == 0x80) {
+        ++from;
+    }
+    return s.substr(0, head) + "\n...\n" + s.substr(from);
+}
+
+// the first rung whose "when" matches the router's answer; rungs are listed from lowest to highest
+size_t dj_pick_rung(json rungs, const json & decision) {
+    const size_t n = rungs.size();
+    for (size_t i = 0; i < n; ++i) {
+        json r  = rungs.at(i);
+        bool ok = true;
+        if (r.contains("when") && r.at("when").is_object()) {
+            for (const auto & w : r.at("when").items()) {
+                bool hit = false;
+                if (decision.contains(w.key()) && w.value().is_array()) {
+                    const std::string have = decision.at(w.key()).dump();
+                    for (const auto & v : w.value()) {
+                        if (v.dump() == have) {
+                            hit = true;
+                        }
+                    }
+                }
+                if (!hit) {
+                    ok = false;
+                }
+            }
+        }
+        if (ok) {
+            return i;
+        }
+    }
+    return n - 1;
+}
+
+void dj_add_hint(json & body, const std::string & hint) {
+    if (hint.empty() || !body.contains("messages") || !body.at("messages").is_array()) {
+        return;
+    }
+    json & msgs = body.at("messages");
+    if (msgs.size() > 0 && msgs.at(0).is_object() && msgs.at(0).value("role", std::string()) == "system" && msgs.at(0).contains("content")) {
+        json & c = msgs.at(0).at("content");
+        if (c.is_string()) {
+            c = c.get<std::string>() + "\n\n" + hint;
+        } else if (c.is_array()) {
+            json part = json::object();
+            part["type"] = "text";
+            part["text"] = hint;
+            c.push_back(part);
+        }
+    } else {
+        json out = json::array();
+        json sys = json::object();
+        sys["role"]    = "system";
+        sys["content"] = hint;
+        out.push_back(sys);
+        for (const auto & m : msgs) {
+            out.push_back(m);
+        }
+        body["messages"] = out;
+    }
+}
+
+// what the client already set wins, unless the policy says override_client
+void dj_apply_rung(json & body, json rung, bool override_client, std::string & set, std::string & kept) {
+    auto client_has = [&](const char * k) { return body.contains(k) && !body.at(k).is_null(); };
+    auto note       = [](std::string & s, const char * what) { s += (s.empty() ? "" : ",") + std::string(what); };
+
+    if (rung.contains("enable_thinking") && rung.at("enable_thinking").is_boolean()) {
+        json kw = json::object();
+        if (body.contains("chat_template_kwargs") && body.at("chat_template_kwargs").is_object()) {
+            kw = body.at("chat_template_kwargs");
+        }
+        const bool client = kw.contains("enable_thinking") || client_has("reasoning_effort");
+        if (!client || override_client) {
+            kw["enable_thinking"]        = rung.at("enable_thinking").get<bool>();
+            body["chat_template_kwargs"] = kw;
+            if (body.contains("reasoning_effort")) {
+                body.erase("reasoning_effort");
+            }
+            note(set, "enable_thinking");
+        } else {
+            note(kept, "enable_thinking");
+        }
+    }
+    if (rung.contains("reasoning_budget_tokens") && rung.at("reasoning_budget_tokens").is_number_integer()) {
+        const bool client = client_has("reasoning_budget_tokens") || client_has("thinking_budget_tokens");
+        if (!client || override_client) {
+            if (body.contains("thinking_budget_tokens")) {
+                body.erase("thinking_budget_tokens");
+            }
+            body["reasoning_budget_tokens"] = rung.at("reasoning_budget_tokens").get<int>();
+            note(set, "reasoning_budget_tokens");
+        } else {
+            note(kept, "reasoning_budget_tokens");
+        }
+    }
+    if (rung.contains("max_tokens") && rung.at("max_tokens").is_number_integer()) {
+        const bool client = client_has("max_tokens") || client_has("max_completion_tokens") || client_has("n_predict");
+        if (!client || override_client) {
+            for (const char * k : { "max_completion_tokens", "n_predict" }) {
+                if (body.contains(k)) {
+                    body.erase(k);
+                }
+            }
+            body["max_tokens"] = rung.at("max_tokens").get<int>();
+            note(set, "max_tokens");
+        } else {
+            note(kept, "max_tokens");
+        }
+    }
+    if (rung.contains("system_hint") && rung.at("system_hint").is_string()) {
+        dj_add_hint(body, rung.at("system_hint").get<std::string>());
+        note(set, "system_hint");
+    }
+}
+
+// header-safe text
+std::string dj_clean(const std::string & s) {
+    std::string out;
+    for (char c : s) {
+        const bool ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' || c == '-' || c == '.' || c == ',';
+        out += ok ? c : '_';
+    }
+    return out;
+}
+
+// Rewrites the chat request in place. Returns the X-Dynamic-Jev header value, or "" when the request was left alone.
+// Per request: "dynamic_jev": false skips the router; "dynamic_jev": {"force_rung": "R1"} skips it and uses that rung.
+std::string dj_route(dj_state & st, json & body, const std::function<bool(const json &, json &)> & run_decision) {
+    try {
+        bool        off = false;
+        std::string forced_rung;
+        if (body.contains("dynamic_jev")) {
+            const json ctl = body.at("dynamic_jev"); // a copy: the key is erased below
+            off = ctl.is_boolean() && !ctl.get<bool>();
+            if (ctl.is_object()) {
+                forced_rung = ctl.value("force_rung", std::string());
+            }
+            body.erase("dynamic_jev");
+        }
+        if (off) {
+            std::lock_guard<std::mutex> lock(st.mtx);
+            st.skipped++;
+            return "";
+        }
+        json pol;
+        {
+            std::lock_guard<std::mutex> lock(st.mtx);
+            pol = st.policy;
+        }
+        json         rungs          = pol.at("rungs");
+        const bool   override_client = pol.value("override_client", false);
+        const size_t steps           = (size_t) std::max(0, pol.value("escalate_steps", 1));
+
+        size_t      idx = rungs.size() - 1;
+        std::string answer;
+        bool        from_cache = false, escalated = false;
+        double      ms = 0.0;
+
+        if (!forced_rung.empty()) {
+            bool found = false;
+            for (size_t i = 0; i < rungs.size(); ++i) {
+                if (rungs.at(i).value("name", std::string()) == forced_rung) {
+                    idx   = i;
+                    found = true;
+                }
+            }
+            if (!found) {
+                throw std::invalid_argument("force_rung \"" + forced_rung + "\" is not in the policy");
+            }
+            answer = "; forced=1";
+        } else {
+            const json        router = pol.at("router");
+            const std::string text   = dj_clip(dj_last_user_text(body), (size_t) router.value("max_chars", 4000));
+            if (text.empty()) {
+                std::lock_guard<std::mutex> lock(st.mtx);
+                st.skipped++;
+                return "";
+            }
+            const size_t key = std::hash<std::string>()(text);
+            json         decision, gate;
+            {
+                std::lock_guard<std::mutex> lock(st.mtx);
+                auto it = st.cache.find(key);
+                if (it != st.cache.end()) {
+                    decision   = it->second.first;
+                    gate       = it->second.second;
+                    from_cache = true;
+                    st.cache_hits++;
+                }
+            }
+            if (!from_cache) {
+                json req = json::object();
+                req["schema"]       = router.at("schema");
+                req["instructions"] = router.value("instructions", std::string("Classify the user's request."));
+                json ctxs = json::array();
+                ctxs.push_back(text);
+                req["contexts"] = ctxs;
+                req["mass"]     = true;
+                if (router.contains("gate")) {
+                    req["gate"] = router.at("gate");
+                }
+                json rep;
+                const auto t0 = std::chrono::steady_clock::now();
+                if (!run_decision(req, rep)) {
+                    throw std::runtime_error("the router decision failed");
+                }
+                ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+                json item = rep.at("results").at(0);
+                decision  = item.at("decision");
+                gate      = item.contains("gate") ? item.at("gate") : json::object();
+                std::lock_guard<std::mutex> lock(st.mtx);
+                st.cache[key] = std::make_pair(decision, gate);
+                st.order.push_back(key);
+                while (st.order.size() > 128) {
+                    st.cache.erase(st.order.front());
+                    st.order.pop_front();
+                }
+            }
+            idx       = dj_pick_rung(rungs, decision);
+            escalated = gate.value("escalate", false);
+            if (escalated) {
+                idx = std::min(idx + steps, rungs.size() - 1);
+            }
+            for (const auto & e : decision.items()) {
+                const json & v = e.value();
+                answer += "; " + dj_clean(e.key()) + "=" + dj_clean(v.is_string() ? v.get<std::string>() : v.dump());
+            }
+        }
+
+        json        rung = rungs.at(idx);
+        std::string set, kept;
+        dj_apply_rung(body, rung, override_client, set, kept);
+        const std::string name = rung.value("name", std::string("R") + std::to_string(idx));
+
+        std::string tag = "rung=" + dj_clean(name) + answer + "; escalated=" + (escalated ? "1" : "0") +
+                          "; router_ms=" + std::to_string((long long) ms) + "; cached=" + (from_cache ? "1" : "0");
+        if (!set.empty()) {
+            tag += "; set=" + set;
+        }
+        if (!kept.empty()) {
+            tag += "; client_wins=" + kept;
+        }
+        {
+            std::lock_guard<std::mutex> lock(st.mtx);
+            st.routed++;
+            st.router_ms += ms;
+            st.by_rung[name]++;
+        }
+        SRV_INF("dynamic-jev: %s\n", tag.c_str());
+        return tag;
+    } catch (const std::exception & e) {
+        {
+            std::lock_guard<std::mutex> lock(st.mtx);
+            st.failed_open++;
+            st.last_error = e.what();
+        }
+        SRV_WRN("dynamic-jev: %s; request left unchanged\n", e.what());
+        return "";
+    }
+}
+
+} // namespace
+
 void server_routes::init_routes() {
     // IMPORTANT: all lambda functions must start with create_response()
     // this is to ensure that the server_res_generator can handle sleeping case correctly
@@ -5912,20 +6297,79 @@ void server_routes::init_routes() {
             TASK_RESPONSE_TYPE_OAI_CMPL);
     };
 
-    this->post_chat_completions = [this](const server_http_req & req) {
+    // --dynamic-jev: classify each chat request with the decision engine and set its thinking level
+    std::shared_ptr<dj_state> dj;
+    if (params.dynamic_jev) {
+        dj         = std::make_shared<dj_state>();
+        dj->policy = dj_load_policy(params.dynamic_jev_policy);
+        SRV_INF("dynamic-jev: enabled with %d rungs, policy: %s\n", (int) dj->policy.at("rungs").size(),
+                params.dynamic_jev_policy.empty() ? "built-in" : params.dynamic_jev_policy.c_str());
+    }
+
+    this->post_chat_completions = [this, dj](const server_http_req & req) {
         auto res = create_response();
         std::vector<raw_buffer> files;
         json body = json::parse(req.body);
+        std::string tag;
+        if (dj) {
+            tag = dj_route(*dj, body, [&](const json & dreq, json & out) -> bool {
+                auto dres = create_response();
+                server_task task(SERVER_TASK_TYPE_DECISION);
+                task.id               = dres->rd.get_new_id();
+                task.decision_request = dreq;
+                dres->rd.post_task(std::move(task));
+                auto result = dres->rd.next([&req]() { return req.should_stop(); });
+                if (!result) {
+                    return false;
+                }
+                if (result->is_error()) {
+                    SRV_WRN("dynamic-jev: the router decision returned an error: %s\n", result->to_json().dump().c_str());
+                    return false;
+                }
+                out = result->to_json();
+                return true;
+            });
+        }
         json body_parsed = oaicompat_chat_params_parse(
             body,
             meta->chat_params,
             files);
-        return handle_completions_impl(
+        auto out = handle_completions_impl(
             req,
             SERVER_TASK_TYPE_COMPLETION,
             body_parsed,
             files,
             TASK_RESPONSE_TYPE_OAI_CHAT);
+        if (out && !tag.empty()) {
+            out->headers["X-Dynamic-Jev"] = tag;
+        }
+        return out;
+    };
+
+    this->get_dynamic_jev = [this, dj](const server_http_req &) {
+        auto res = create_response();
+        json out = json::object();
+        out["object"]  = "dynamic_jev";
+        out["enabled"] = dj != nullptr;
+        if (dj) {
+            std::lock_guard<std::mutex> lock(dj->mtx);
+            out["policy"] = dj->policy;
+            json st = json::object();
+            st["routed"]        = dj->routed;
+            st["cache_hits"]    = dj->cache_hits;
+            st["failed_open"]   = dj->failed_open;
+            st["skipped"]       = dj->skipped;
+            st["router_ms_avg"] = dj->routed > 0 ? dj->router_ms / (double) dj->routed : 0.0;
+            st["last_error"]    = dj->last_error;
+            json by = json::object();
+            for (const auto & kv : dj->by_rung) {
+                by[kv.first] = kv.second;
+            }
+            st["by_rung"] = by;
+            out["stats"]  = st;
+        }
+        res->ok(out);
+        return res;
     };
 
     this->post_chat_completions_tok = [this](const server_http_req & req) {
