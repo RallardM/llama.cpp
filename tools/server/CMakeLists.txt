@@ -15,14 +15,8 @@ add_library(${TARGET} STATIC
     server-common.h
     server-context.cpp
     server-context.h
-    server-stream.cpp
-    server-stream.h
     server-tools.cpp
     server-tools.h
-    server-mcp.cpp
-    server-mcp.h
-    server-schema.cpp
-    server-schema.h
 )
 
 if (BUILD_SHARED_LIBS)
@@ -48,9 +42,7 @@ set_target_properties(${TARGET} PROPERTIES WINDOWS_EXPORT_ALL_SYMBOLS ON)
 
 target_include_directories(${TARGET} PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_include_directories(${TARGET} PRIVATE ../mtmd ${PROJECT_SOURCE_DIR})
-target_link_libraries(${TARGET} PUBLIC server-context llama-ui cpp-httplib ${CMAKE_THREAD_LIBS_INIT})
-
-add_dependencies(${TARGET} llama-ui-assets)
+target_link_libraries(${TARGET} PUBLIC server-context cpp-httplib ${CMAKE_THREAD_LIBS_INIT})
 
 if(LLAMA_TOOLS_INSTALL)
     install(TARGETS ${TARGET} LIBRARY)
@@ -60,8 +52,8 @@ endif()
 
 set(TARGET llama-server)
 
-add_executable(${TARGET} main.cpp)
+add_executable(${TARGET} server.cpp server-http.cpp server-http.h server-models.cpp server-models.h)
 install(TARGETS ${TARGET} RUNTIME)
 
-target_link_libraries(${TARGET} PRIVATE llama-server-impl)
+target_link_libraries(${TARGET} PRIVATE server-context)
 target_compile_features(${TARGET} PRIVATE cxx_std_17)

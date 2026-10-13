@@ -23,7 +23,7 @@ else()
     add_subdirectory(perplexity)
     add_subdirectory(quantize)
     if (LLAMA_BUILD_SERVER)
-        add_subdirectory(ui)
+        # add_subdirectory(ui)  # ui directory not present in moe-cache
         add_subdirectory(cli)
         add_subdirectory(server)
     endif()
