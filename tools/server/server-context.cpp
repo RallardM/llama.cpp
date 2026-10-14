@@ -5887,6 +5887,44 @@ std::string dj_clean(const std::string & s) {
     return out;
 }
 
+// log-safe preview of a text: at most n bytes from the front (or the back), cut on a UTF-8 boundary, control chars as spaces
+std::string dj_peek(const std::string & s, size_t n, bool from_end) {
+    size_t a = 0, b = s.size();
+    if (s.size() > n) {
+        if (from_end) {
+            a = s.size() - n;
+            while (a < s.size() && (static_cast<unsigned char>(s[a]) & 0xC0) == 0x80) {
+                ++a;
+            }
+        } else {
+            b = n;
+            while (b > 0 && (static_cast<unsigned char>(s[b]) & 0xC0) == 0x80) {
+                --b;
+            }
+        }
+    }
+    std::string out = s.substr(a, b - a);
+    for (char & c : out) {
+        if (static_cast<unsigned char>(c) < 0x20 || c == '"') {
+            c = ' ';
+        }
+    }
+    return out;
+}
+
+// how many user messages hold text
+size_t dj_user_msgs(const json & body) {
+    size_t n = 0;
+    if (body.contains("messages") && body.at("messages").is_array()) {
+        for (const auto & m : body.at("messages")) {
+            if (m.is_object() && m.value("role", std::string()) == "user" && m.contains("content") && !dj_message_text(m.at("content")).empty()) {
+                ++n;
+            }
+        }
+    }
+    return n;
+}
+
 // an agent request: it offers tools, or it already holds tool results / tool calls
 bool dj_is_agent(const json & body) {
     if (body.contains("tools") && body.at("tools").is_array() && body.at("tools").size() > 0) {
@@ -5982,6 +6020,8 @@ std::string dj_route(dj_state & st, json & body, const std::function<bool(const 
                 st.skipped++;
                 return "";
             }
+            SRV_INF("dynamic-jev: router input: chars=%zu user_msgs=%zu agent=%d head=\"%s\" tail=\"%s\"\n", text.size(), dj_user_msgs(body),
+                    agent ? 1 : 0, dj_peek(text, 200, false).c_str(), dj_peek(text, 120, true).c_str());
             const size_t key = std::hash<std::string>()(text);
             json         decision, gate;
             {
@@ -6419,6 +6459,7 @@ void server_routes::init_routes() {
             st["cache_hits"]    = dj->cache_hits;
             st["failed_open"]   = dj->failed_open;
             st["skipped"]       = dj->skipped;
+            st["cache_size"]    = (long long) dj->cache.size();
             st["agent_skipped"]   = dj->agent_skipped;
             st["agent_protected"] = dj->agent_protected;
             st["router_ms_avg"] = dj->routed > 0 ? dj->router_ms / (double) dj->routed : 0.0;
