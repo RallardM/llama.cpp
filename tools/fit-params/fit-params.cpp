@@ -1,23 +1,34 @@
-#include "llama.h"
 #include "../src/llama-ext.h"
-
 #include "arg.h"
 #include "common.h"
 #include "fit.h"
+#include "llama.h"
 #include "log.h"
 
+#include <algorithm>
 #include <cinttypes>
 
 #if defined(_MSC_VER)
 #pragma warning(disable: 4244 4267) // possible loss of data
 #endif
 
-int main(int argc, char ** argv) {
+// satisfies -Wmissing-declarations
+int llama_fit_params(int argc, char ** argv);
+
+int llama_fit_params(int argc, char ** argv) {
     common_params params;
 
     common_init();
 
     if (!common_params_parse(argc, argv, params, LLAMA_EXAMPLE_FIT_PARAMS)) {
+        return 1;
+    }
+
+    const bool has_model_backed_spec =
+        params.speculative.has_dft() || std::find(params.speculative.types.begin(), params.speculative.types.end(),
+                                                  COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
+    if (has_model_backed_spec && !params.fit_moe_joint_report_json) {
+        fprintf(stderr, "%s: model-backed speculative arguments require --fit-moe-joint-report-json\n", __func__);
         return 1;
     }
 
@@ -27,10 +38,58 @@ int main(int argc, char ** argv) {
     auto mparams = common_model_params_to_llama(params);
     auto cparams = common_context_params_to_llama(params);
 
+    if (params.fit_moe_joint_report_json) {
+        // This mode is strict and machine-facing. It measures the frozen
+        // target plus every active model-backed speculative component.
+        common_log_flush(common_log_main());
+        llama_log_set([](ggml_log_level, const char * text, void *) { fputs(text, stderr); }, nullptr);
+        const auto measurement = common_measure_joint_configuration(
+            params, params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR, true);
+        const std::string output = common_joint_measurement_json(measurement);
+        fwrite(output.data(), 1, output.size(), stdout);
+        fputc('\n', stdout);
+        fflush(stdout);
+        return measurement.admission_qualified ? 0 : 2;
+    }
+
+    if (params.fit_moe_report != 0) {
+        if (params.model.path.empty()) {
+            LOG_ERR("%s: --fit-moe-report requires a local model path\n", __func__);
+            return 1;
+        }
+        if (params.fit_moe_report == 2) {
+            // Keep stdout machine-clean. Loader diagnostics remain available on
+            // stderr and are never embedded into the JSON object.
+            common_log_flush(common_log_main());
+            llama_log_set([](ggml_log_level, const char * text, void *) {
+                fputs(text, stderr);
+            }, nullptr);
+        }
+        llama_model_params probe_params = mparams;
+        probe_params.no_alloc = true;
+        llama_model * model = llama_model_load_from_file(params.model.path.c_str(), probe_params);
+        if (model == nullptr) {
+            fprintf(stderr, "%s: failed to collect MoE placement\n", __func__);
+            return 1;
+        }
+        const auto report = llama_model_moe_placement(model);
+        const std::string output = params.fit_moe_report == 2 ?
+            common_moe_placement_report_json(report, mparams, cparams, &params) :
+            common_moe_placement_report_human(report, mparams, cparams, &params);
+        llama_model_free(model);
+        fwrite(output.data(), 1, output.size(), stdout);
+        if (output.empty() || output.back() != '\n') {
+            fputc('\n', stdout);
+        }
+        fflush(stdout);
+        return 0;
+    }
+
     if (!params.fit_params_print) {
         const common_params_fit_status status = common_fit_params(params.model.path.c_str(), &mparams, &cparams,
                 params.tensor_split, params.tensor_buft_overrides.data(), params.fit_params_target.data(), params.fit_params_min_ctx,
-                params.verbosity >= 4 ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
+                nullptr,
+                params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
         if (status != COMMON_PARAMS_FIT_STATUS_SUCCESS) {
             LOG_ERR("%s: failed to fit CLI arguments to free memory, exiting...\n", __func__);
             exit(1);

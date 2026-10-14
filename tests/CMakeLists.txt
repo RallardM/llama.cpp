@@ -10,7 +10,7 @@ function(llama_build source)
     endif()
 
     add_executable(${TEST_TARGET} ${TEST_SOURCES})
-    target_link_libraries(${TEST_TARGET} PRIVATE llama llama-common)
+    target_link_libraries(${TEST_TARGET} PRIVATE llama llama-common) # TODO: [TAG_TESTS_LLAMA_LINK]
     if (LLAMA_TESTS_INSTALL)
         install(TARGETS ${TEST_TARGET} RUNTIME)
     endif()
@@ -87,7 +87,7 @@ function(llama_build_and_test source)
     set(multiValueArgs ARGS)
     cmake_parse_arguments(LLAMA_TEST "${options}" "${oneValueArgs}" "${multiValueArgs}" ${ARGN})
 
-    set(TEST_SOURCES ${source} ${LLAMA_TEST_UNPARSED_ARGUMENTS} get-model.cpp)
+    set(TEST_SOURCES ${source} ${LLAMA_TEST_UNPARSED_ARGUMENTS})
 
     if (NOT DEFINED LLAMA_TEST_LABEL)
         set(LLAMA_TEST_LABEL "main")
@@ -131,6 +131,7 @@ llama_test(test-tokenizer-0 NAME test-tokenizer-0-llama-spm         ARGS ${PROJE
 llama_test(test-tokenizer-0 NAME test-tokenizer-0-mpt               ARGS ${PROJECT_SOURCE_DIR}/models/ggml-vocab-mpt.gguf)
 llama_test(test-tokenizer-0 NAME test-tokenizer-0-phi-3             ARGS ${PROJECT_SOURCE_DIR}/models/ggml-vocab-phi-3.gguf)
 llama_test(test-tokenizer-0 NAME test-tokenizer-0-qwen2             ARGS ${PROJECT_SOURCE_DIR}/models/ggml-vocab-qwen2.gguf)
+llama_test(test-tokenizer-0 NAME test-tokenizer-0-qwen35            ARGS ${PROJECT_SOURCE_DIR}/models/ggml-vocab-qwen35.gguf)
 llama_test(test-tokenizer-0 NAME test-tokenizer-0-refact            ARGS ${PROJECT_SOURCE_DIR}/models/ggml-vocab-refact.gguf)
 llama_test(test-tokenizer-0 NAME test-tokenizer-0-starcoder         ARGS ${PROJECT_SOURCE_DIR}/models/ggml-vocab-starcoder.gguf)
 
@@ -147,21 +148,24 @@ if (LLAMA_LLGUIDANCE)
     llama_build_and_test(test-grammar-llguidance.cpp ARGS ${PROJECT_SOURCE_DIR}/models/ggml-vocab-llama-bpe.gguf)
 endif ()
 
+llama_build(test-recurrent-state-rollback.cpp)
+llama_build(test-save-load-state.cpp)
+
 if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
+    target_compile_definitions(test-recurrent-state-rollback PRIVATE LLAMA_TEST_RECURRENT_INTERNALS)
+
     # these tests are disabled on Windows because they use internal functions not exported with LLAMA_API (when building with shared libraries)
+    llama_build_and_test(test-unicode.cpp)
     llama_build_and_test(test-sampling.cpp)
     llama_build_and_test(test-reasoning-budget.cpp)
     llama_build_and_test(test-grammar-parser.cpp)
     llama_build_and_test(test-grammar-integration.cpp)
     llama_build_and_test(test-llama-grammar.cpp)
+    llama_build_and_test(test-batch-alloc.cpp)
     llama_build_and_test(test-chat.cpp WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
     target_include_directories(test-chat PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
     target_link_libraries(test-chat PRIVATE server-context)
-    # TODO: disabled on loongarch64 because the ggml-ci node lacks Python 3.8
-    if (NOT ${CMAKE_SYSTEM_PROCESSOR} MATCHES "loongarch64")
-        llama_build_and_test(test-json-schema-to-grammar.cpp   WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
-        target_include_directories(test-json-schema-to-grammar PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
-    endif()
+    llama_build_and_test(test-json-schema-to-grammar.cpp)
 
     if (NOT GGML_BACKEND_DL)
         llama_build(test-quantize-stats.cpp)
@@ -190,15 +194,110 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
 
     # llama_build_and_test(test-double-float.cpp) # SLOW
 
-    llama_build_and_test(test-llama-archs.cpp)
+    llama_build(test-llama-archs.cpp)
+
+    llama_test(
+        test-llama-archs
+        NAME test-phase-aware-workspace
+        LABEL main
+        ARGS --test-phase-workspace
+    )
+
+    llama_test(
+        test-llama-archs
+        NAME test-live-context-workspace
+        LABEL main
+        ARGS --test-live-context-workspace
+    )
+
+    llama_test(
+        test-llama-archs
+        NAME test-speculative-limits
+        LABEL main
+        ARGS --test-speculative-limits
+    )
+
+    set(MOE_JOINT_MEASUREMENT_ARGS --test-moe-joint-measurement)
+    # The tools directory is added after tests, so use the same build guards
+    # as the fit-params target rather than TARGET, which is not available yet.
+    if (LLAMA_BUILD_TOOLS AND NOT EMSCRIPTEN)
+        list(APPEND MOE_JOINT_MEASUREMENT_ARGS
+            --fit-tool $<TARGET_FILE:llama-fit-params>
+        )
+    endif()
+
+    llama_test(
+        test-llama-archs
+        NAME test-moe-joint-measurement
+        ARGS ${MOE_JOINT_MEASUREMENT_ARGS}
+    )
+    if (LLAMA_BUILD_TOOLS AND NOT EMSCRIPTEN)
+        add_dependencies(test-llama-archs llama-fit-params)
+    endif()
+    set_tests_properties(test-moe-joint-measurement PROPERTIES LABELS "main;moe-cache")
+    target_link_libraries(test-llama-archs PRIVATE vendor::hash)
+
+    if (GGML_CUDA)
+        llama_test(
+            test-llama-archs
+            NAME test-moe-cache-selector
+            ARGS --test-moe-cache-selector
+        )
+        set_tests_properties(test-moe-cache-selector PROPERTIES
+            LABELS "main;moe-cache"
+            SKIP_RETURN_CODE 77)
+        llama_test(
+            test-llama-archs
+            NAME test-moe-placement
+            ARGS --test-moe-placement
+        )
+        set_tests_properties(test-moe-placement PROPERTIES
+            LABELS "main;moe-cache"
+            SKIP_RETURN_CODE 77)
+    endif()
+
+    set(MODEL_DIR "${CMAKE_CURRENT_BINARY_DIR}/test-models/")
+    file(MAKE_DIRECTORY "${MODEL_DIR}")
+
+    llama_test(
+        test-llama-archs
+        NAME test-generate-models
+        LABEL main
+        ARGS -o "${MODEL_DIR}"
+    )
+    set_tests_properties(test-generate-models PROPERTIES
+        FIXTURES_SETUP generate-models
+    )
+
+    # Test recurrent/hybrid state rollback on all generated recurrent/hybrid dummy models
+    llama_test(
+        test-recurrent-state-rollback
+        LABEL main
+        ARGS -m "${MODEL_DIR}"
+    )
+    set_tests_properties(test-recurrent-state-rollback PROPERTIES
+        FIXTURES_REQUIRED generate-models
+    )
+
+    # Test state save/load functionality across all architectures, using the generated dummy models
+    llama_test(
+        test-save-load-state
+        LABEL main
+        ARGS --models "${MODEL_DIR}"
+    )
+    set_tests_properties(test-save-load-state PROPERTIES FIXTURES_REQUIRED generate-models)
+
+    llama_build(test-fusion.cpp)
 endif()
 
 llama_build_and_test(test-chat-peg-parser.cpp peg-parser/simple-tokenize.cpp)
 llama_build_and_test(test-jinja.cpp)
 llama_test(test-jinja NAME test-jinja-py ARGS -py LABEL python)
+llama_build_and_test(test-json-schema.cpp)
 llama_build_and_test(test-chat-auto-parser.cpp WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
 llama_build_and_test(test-chat-template.cpp)
-llama_build_and_test(test-json-partial.cpp)
+# debug tool for chat template differential analysis (not registered as a test, run it manually)
+llama_build(test-chat-analysis.cpp)
 llama_build_and_test(test-log.cpp)
 llama_build_and_test(
     test-peg-parser.cpp
@@ -211,7 +310,6 @@ llama_build_and_test(
     peg-parser/test-unicode.cpp
     peg-parser/tests.h
 )
-llama_build_and_test(test-regex-partial.cpp)
 
 if (NOT ${CMAKE_SYSTEM_PROCESSOR} MATCHES "s390x")
     set(MODEL_NAME "tinyllamas/stories15M-q4_0.gguf")
@@ -226,7 +324,7 @@ add_test(NAME test-download-model COMMAND ${CMAKE_COMMAND}
     -DDEST=${MODEL_DEST}
     -DNAME=${MODEL_NAME}
     -DHASH=${MODEL_HASH}
-    -P ${CMAKE_SOURCE_DIR}/cmake/download-models.cmake
+    -P ${PROJECT_SOURCE_DIR}/cmake/download-models.cmake
 )
 set_tests_properties(test-download-model PROPERTIES FIXTURES_SETUP test-download-model)
 
@@ -234,13 +332,23 @@ llama_build_and_test(test-thread-safety.cpp ARGS -m "${MODEL_DEST}" -ngl 99 -p "
 set_tests_properties(test-thread-safety PROPERTIES FIXTURES_REQUIRED test-download-model)
 
 llama_build_and_test(test-arg-parser.cpp)
+llama_build_and_test(test-model-resolution.cpp)
+# the test serves its repos from an httplib server, and the library links it privately
+target_link_libraries(test-model-resolution PRIVATE cpp-httplib)
 
 if (NOT LLAMA_SANITIZE_ADDRESS AND NOT GGML_SCHED_NO_REALLOC)
   # TODO: repair known memory leaks
   llama_build_and_test(test-opt.cpp)
 endif()
-llama_build_and_test(test-gguf.cpp)
-llama_build_and_test(test-backend-ops.cpp)
+
+# TODO: make this test (and others) not link `libllama` as it is not needed [TAG_TESTS_LLAMA_LINK]
+llama_build(test-backend-ops.cpp)
+if (GGML_RPC AND UNIX AND NOT GGML_BACKEND_DL)
+    target_compile_definitions(test-backend-ops PRIVATE GGML_TEST_RPC)
+    target_link_libraries(test-backend-ops PRIVATE ggml-rpc)
+    llama_test(test-backend-ops NAME test-backend-ops-rpc-gdn-rejection LABEL main ARGS --rpc-gdn-rejection)
+    set_tests_properties(test-backend-ops-rpc-gdn-rejection PROPERTIES TIMEOUT 15)
+endif()
 
 llama_build_and_test(test-model-load-cancel.cpp LABEL "model")
 llama_build_and_test(test-autorelease.cpp       LABEL "model")
@@ -251,12 +359,17 @@ llama_build_and_test(test-backend-sampler.cpp   LABEL "model")
 llama_build_and_test(test-state-restore-fragmented.cpp LABEL "model" ARGS -m "${MODEL_DEST}")
 set_tests_properties(test-state-restore-fragmented PROPERTIES FIXTURES_REQUIRED test-download-model)
 
-if (NOT GGML_BACKEND_DL)
+if (APPLE)
+    llama_build(test-rset-release.cpp)
+endif()
+
+if (NOT GGML_BACKEND_DL AND GGML_CPU)
     # these tests use the backends directly and cannot be built with dynamic loading
     llama_build_and_test(test-barrier.cpp)
     llama_build_and_test(test-quantize-fns.cpp)
     llama_build_and_test(test-quantize-perf.cpp)
     llama_build_and_test(test-rope.cpp)
+    llama_build_and_test(test-col2im-1d.cpp)
 endif()
 
 # libmtmd
@@ -264,6 +377,9 @@ set(LLAMA_TEST_NAME test-mtmd-c-api)
 llama_build_and_test(test-mtmd-c-api.c)
 target_link_libraries(${LLAMA_TEST_NAME} PRIVATE mtmd)
 unset(LLAMA_TEST_NAME)
+
+llama_build_and_test(test-mtmd-impl.cpp)
+target_link_libraries(test-mtmd-impl PRIVATE mtmd)
 
 # GGUF model data fetcher library for tests that need real model metadata
 # Only compile when cpp-httplib has SSL support (CPPHTTPLIB_OPENSSL_SUPPORT)
@@ -291,28 +407,45 @@ get_filename_component(TEST_TARGET test-c.c NAME_WE)
 add_executable(${TEST_TARGET} test-c.c)
 target_link_libraries(${TEST_TARGET} PRIVATE llama)
 
-llama_build_and_test(test-alloc.cpp)
-target_include_directories(test-alloc PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
+if (NOT LLAMA_USE_SYSTEM_GGML)
+    # Needs non-public ggml-impl.h
+    llama_build_and_test(test-gguf.cpp)
 
-llama_build(export-graph-ops.cpp)
-target_include_directories(export-graph-ops PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
-if (TARGET gguf-model-data)
-    target_link_libraries(export-graph-ops PRIVATE gguf-model-data)
-    target_compile_definitions(export-graph-ops PRIVATE LLAMA_HF_FETCH)
+    # Needs non-public ggml{,-backend}-impl.h
+    llama_build_and_test(test-alloc.cpp)
 endif()
 
-# MoE expert cache test (CUDA only). Built when CUDA is enabled and the
-# backend is statically linked so the cache symbols are visible to the test.
-# When GGML_BACKEND_DL=ON the test is skipped — that path is week-2 work.
+llama_build(test-export-graph-ops.cpp)
+if (TARGET gguf-model-data)
+    target_link_libraries(test-export-graph-ops PRIVATE gguf-model-data)
+    target_compile_definitions(test-export-graph-ops PRIVATE LLAMA_HF_FETCH)
+endif()
+
+# This test uses internal symbols that are not exported from Windows DLLs.
 #
-# The test is a plain .cpp (no device kernels, only host-side cudaMalloc /
+# The test sources are plain C++ (no device kernels, only host-side cudaMalloc /
 # cudaMemcpyAsync calls), so it does not require enable_language(CUDA) in
 # this directory scope. CUDA headers + libcudart come in via CUDA::cudart.
-if (GGML_CUDA AND NOT GGML_BACKEND_DL AND TARGET ggml-cuda)
+if (GGML_CUDA AND NOT GGML_BACKEND_DL AND TARGET ggml-cuda AND (NOT WIN32 OR NOT BUILD_SHARED_LIBS))
     find_package(CUDAToolkit REQUIRED)
-    add_executable(test-moe-cache test-moe-cache.cpp)
-    target_link_libraries(test-moe-cache PRIVATE ggml-cuda ggml-base CUDA::cudart)
+    add_executable(test-moe-cache
+        test-moe-cache.cpp
+        test-moe-cache-fixtures.cpp
+        test-moe-cache-registry.cpp
+        test-moe-cache-plans.cpp
+        test-moe-cache-graphs.cpp
+        test-moe-cache-dispatch.cpp
+        test-moe-cache-mmid.cpp
+        test-moe-cache-staging.cpp
+        test-moe-cache-multigpu.cpp
+    )
+    target_compile_features(test-moe-cache PRIVATE cxx_std_17)
+    target_link_libraries(test-moe-cache PRIVATE llama ggml-cuda ggml-base CUDA::cudart)
     target_include_directories(test-moe-cache PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
     add_test(NAME test-moe-cache COMMAND test-moe-cache)
+    add_test(NAME test-moe-cache-layer COMMAND test-moe-cache --grouped-layer-only)
+    set_tests_properties(test-moe-cache-layer PROPERTIES LABELS "main")
+    add_test(NAME test-moe-cache-multigpu COMMAND test-moe-cache --grouped-multigpu-only)
+    set_tests_properties(test-moe-cache-multigpu PROPERTIES SKIP_RETURN_CODE 77 LABELS "main;multigpu")
     set_property(TEST test-moe-cache PROPERTY LABELS "main")
 endif()

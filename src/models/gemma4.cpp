@@ -2,16 +2,16 @@
 
 void llama_model_gemma4::load_arch_hparams(llama_model_loader & ml) {
     hparams.swa_type = LLAMA_SWA_TYPE_STANDARD;
-    ml.get_key_or_arr(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN, hparams.swa_layers, hparams.n_layer);
+    ml.get_arr(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN, hparams.is_swa_impl);
 
     uint32_t n_kv_shared_layers = 0;
     ml.get_key(LLM_KV_ATTENTION_SHARED_KV_LAYERS, n_kv_shared_layers, false);
 
-    hparams.n_layer_kv_from_start = hparams.n_layer - (int32_t)n_kv_shared_layers;
+    hparams.n_layer_kv_from_start = hparams.n_layer_all - (int32_t)n_kv_shared_layers;
     hparams.f_attention_scale     = 1.0f; // Gemma4 uses self.scaling = 1.0 (no pre-attn scaling)
 
     ml.get_key(LLM_KV_ROPE_FREQ_BASE_SWA,          hparams.rope_freq_base_train_swa, false);
-    ml.get_key(LLM_KV_EXPERT_FEED_FORWARD_LENGTH,  hparams.n_ff_exp, false);
+    ml.get_key_or_arr(LLM_KV_EXPERT_FEED_FORWARD_LENGTH, hparams.n_ff_exp_arr, hparams.n_layer_all, false);
     ml.get_key(LLM_KV_ATTENTION_SLIDING_WINDOW,    hparams.n_swa);
     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
     ml.get_key(LLM_KV_EMBEDDING_LENGTH_PER_LAYER,  hparams.n_embd_per_layer);
@@ -19,7 +19,12 @@ void llama_model_gemma4::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_ATTENTION_VALUE_LENGTH_SWA,  hparams.n_embd_head_v_swa);
     ml.get_key(LLM_KV_FINAL_LOGIT_SOFTCAPPING,     hparams.f_final_logit_softcapping, false);
 
-    switch (hparams.n_layer) {
+    // when non_causal is set, the model will use bidirectional attention on SWA layers only, while dense layers will remain causal
+    // ref: use_bidirectional_attention == "vision" in HF config
+    // note: E2B/E4B are always causal, bypassing this logic
+    hparams.non_causal_type = LLAMA_NON_CAUSAL_TYPE_SWA_ONLY;
+
+    switch (hparams.n_layer()) {
         case 30: type = LLM_TYPE_26B_A4B; break;
         case 35: type = LLM_TYPE_E2B; break;
         case 42: type = LLM_TYPE_E4B; break;
@@ -32,7 +37,7 @@ void llama_model_gemma4::load_arch_tensors(llama_model_loader &) {
     LLAMA_LOAD_LOCALS;
 
     const uint32_t n_embd_per_layer = hparams.n_embd_per_layer;
-    const int64_t  n_ff_exp         = hparams.n_ff_exp;
+    const int64_t  n_ff_exp         = hparams.n_ff_exp();
 
     if (n_embd_head_k != n_embd_head_v) {
         throw std::runtime_error("Gemma 4 requires n_embd_head_k == n_embd_head_v");
@@ -50,7 +55,7 @@ void llama_model_gemma4::load_arch_tensors(llama_model_loader &) {
     tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, 0);
 
     if (n_embd_per_layer > 0) {
-        per_layer_tok_embd   = create_tensor(tn(LLM_TENSOR_PER_LAYER_TOKEN_EMBD, "weight"),    {n_embd_per_layer * n_layer, n_vocab}, 0);
+        per_layer_tok_embd   = create_tensor(tn(LLM_TENSOR_PER_LAYER_TOKEN_EMBD, "weight"),    {n_embd_per_layer * n_layer, n_vocab}, TENSOR_READ_LAZY);
         per_layer_model_proj = create_tensor(tn(LLM_TENSOR_PER_LAYER_MODEL_PROJ, "weight", 0), {n_embd, n_embd_per_layer * n_layer}, 0);
         per_layer_proj_norm  = create_tensor(tn(LLM_TENSOR_PER_LAYER_PROJ_NORM,  "weight", 0), {n_embd_per_layer}, 0);
     }
@@ -70,9 +75,13 @@ void llama_model_gemma4::load_arch_tensors(llama_model_loader &) {
         layer.attn_norm = create_tensor(tn(LLM_TENSOR_ATTN_NORM, "weight", i), {n_embd}, 0);
 
         // note: use_alternative_attention (v_proj is optional, if it's not present, use k_proj)
-        layer.wq = create_tensor(tn(LLM_TENSOR_ATTN_Q,   "weight", i), {n_embd, n_embd_head * n_head}, 0);
-        layer.wk = create_tensor(tn(LLM_TENSOR_ATTN_K,   "weight", i), {n_embd, n_embd_k}, kv_flags);
-        layer.wv = create_tensor(tn(LLM_TENSOR_ATTN_V,   "weight", i), {n_embd, n_embd_v}, TENSOR_NOT_REQUIRED);
+        layer.wqkv = create_tensor(tn(LLM_TENSOR_ATTN_QKV, "weight", i),
+            {n_embd, n_embd_head * n_head + n_embd_k + n_embd_v}, TENSOR_NOT_REQUIRED | TENSOR_SKIP_IF_VIRTUAL);
+        if (!layer.wqkv) {
+            layer.wq = create_tensor(tn(LLM_TENSOR_ATTN_Q, "weight", i), {n_embd, n_embd_head * n_head}, 0);
+            layer.wk = create_tensor(tn(LLM_TENSOR_ATTN_K, "weight", i), {n_embd, n_embd_k}, kv_flags);
+            layer.wv = create_tensor(tn(LLM_TENSOR_ATTN_V, "weight", i), {n_embd, n_embd_v}, TENSOR_NOT_REQUIRED);
+        }
         layer.wo = create_tensor(tn(LLM_TENSOR_ATTN_OUT, "weight", i), {n_embd_head * n_head, n_embd}, 0);
 
         layer.attn_q_norm    = create_tensor(tn(LLM_TENSOR_ATTN_Q_NORM,    "weight", i), {n_embd_head}, 0);
@@ -110,7 +119,13 @@ void llama_model_gemma4::load_arch_tensors(llama_model_loader &) {
             layer.ffn_post_norm_2 = create_tensor(tn(LLM_TENSOR_FFN_POST_NORM_2, "weight", i), {n_embd}, 0);
 
             // MoE FFN
-            layer.ffn_gate_up_exps  = create_tensor(tn(LLM_TENSOR_FFN_GATE_UP_EXPS,  "weight", i), {n_embd, n_ff_exp * 2, n_expert}, 0);
+            layer.ffn_gate_up_exps  = create_tensor(tn(LLM_TENSOR_FFN_GATE_UP_EXPS,  "weight", i), {n_embd, n_ff_exp * 2, n_expert}, TENSOR_NOT_REQUIRED);
+
+            if (layer.ffn_gate_up_exps == nullptr) {
+                layer.ffn_gate_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", i), {n_embd, n_ff_exp, n_expert}, 0);
+                layer.ffn_up_exps   = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS,   "weight", i), {n_embd, n_ff_exp, n_expert}, 0);
+            }
+
             layer.ffn_down_exps     = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS,     "weight", i), {n_ff_exp, n_embd, n_expert}, 0);
 
             // per-expert scale will be loaded as down_exps_s at the end of the current switch case
@@ -130,7 +145,7 @@ std::unique_ptr<llm_graph_context> llama_model_gemma4::build_arch_graph(const ll
 }
 
 // get 2D slice view from a 3D tensor, the idx corresponds to the 3rd dim
-static ggml_tensor * ggml_view_2d_slice(ggml_context * ctx0, ggml_tensor * x, int idx) {
+static ggml_tensor * gemma4_view_2d_slice(ggml_context * ctx0, ggml_tensor * x, int idx) {
     GGML_ASSERT(idx < (int) x->ne[2]);
     return ggml_view_2d(ctx0, x, x->ne[0], x->ne[1], ggml_row_size(x->type, x->ne[0]),
                         idx * x->ne[0] * x->ne[1] * ggml_element_size(x));
@@ -177,6 +192,8 @@ llama_model_gemma4::graph::graph(const llama_model & model, const llm_graph_para
         const float freq_scale_l = model.get_rope_freq_scale(cparams, il);
         const int   n_rot_l      = hparams.n_rot(il);
 
+        res->t_layer_inp[il] = inpL;
+
         // norm
         cur = build_norm(inpL, model.layers[il].attn_norm, nullptr, LLM_NORM_RMS, il);
         cb(cur, "attn_norm", il);
@@ -189,9 +206,17 @@ llama_model_gemma4::graph::graph(const llama_model & model, const llm_graph_para
 
         // Q projection (shared for both non-KV and KV layers)
         // this is to mirror Gemma4Attention in pytorch code
+        ggml_tensor * qkv_fused = nullptr;
         ggml_tensor * Qcur;
-        {
+        if (model.layers[il].wqkv) {
+            qkv_fused = build_lora_mm(model.layers[il].wqkv, cur, model.layers[il].wqkv_s);
+            cb(qkv_fused, "wqkv", il);
+            const int64_t q_dim = n_embd_head * n_head;
+            Qcur = ggml_cont(ctx0, ggml_view_2d(ctx0, qkv_fused, q_dim, n_tokens, qkv_fused->nb[1], 0));
+        } else {
             Qcur = build_lora_mm(model.layers[il].wq, cur, model.layers[il].wq_s);
+        }
+        {
             cb(Qcur, "Qcur", il);
 
             Qcur = ggml_reshape_3d(ctx0, Qcur, n_embd_head, n_head, n_tokens);
@@ -206,12 +231,22 @@ llama_model_gemma4::graph::graph(const llama_model & model, const llm_graph_para
 
         // self-attention
         if (hparams.has_kv(il)) {
-            ggml_tensor * Kcur = build_lora_mm(model.layers[il].wk, cur, model.layers[il].wk_s);
+            ggml_tensor * Kcur;
+            ggml_tensor * Vcur;
+            if (qkv_fused) {
+                const int64_t q_dim = n_embd_head * n_head;
+                const int64_t k_dim = n_embd_head * n_head_kv;
+                const int64_t v_dim = n_embd_head * n_head_kv;
+                const size_t  esize = ggml_element_size(qkv_fused);
+                Kcur = ggml_cont(ctx0, ggml_view_2d(ctx0, qkv_fused, k_dim, n_tokens, qkv_fused->nb[1], q_dim * esize));
+                Vcur = ggml_cont(ctx0, ggml_view_2d(ctx0, qkv_fused, v_dim, n_tokens, qkv_fused->nb[1], (q_dim + k_dim) * esize));
+            } else {
+                Kcur = build_lora_mm(model.layers[il].wk, cur, model.layers[il].wk_s);
+                Vcur = model.layers[il].wv
+                       ? build_lora_mm(model.layers[il].wv, cur, model.layers[il].wv_s)
+                       : Kcur; // if v_proj is not present, use Kcur as Vcur
+            }
             cb(Kcur, "Kcur", il);
-
-            ggml_tensor * Vcur = model.layers[il].wv
-                                    ? build_lora_mm(model.layers[il].wv, cur, model.layers[il].wv_s)
-                                    : Kcur; // if v_proj is not present, use Kcur as Vcur
             cb(Vcur, "Vcur", il);
 
             Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens);
@@ -239,7 +274,8 @@ llama_model_gemma4::graph::graph(const llama_model & model, const llm_graph_para
         }
 
         // TODO @ngxson : strip unused token right after the last KV layer to speed up prompt processing
-        if (il == n_layer - 1 && inp_out_ids) {
+        // keep all rows when extracting unmasked nextn embeddings (MTP target needs the hidden state for every token)
+        if (il == n_layer - 1 && inp_out_ids && cparams.embeddings_nextn_masked) {
             cur  = ggml_get_rows(ctx0,  cur, inp_out_ids);
             inpL = ggml_get_rows(ctx0, inpL, inp_out_ids);
         }
@@ -286,8 +322,8 @@ llama_model_gemma4::graph::graph(const llama_model & model, const llm_graph_para
 
             cur_moe = build_moe_ffn(cur_moe,
                     nullptr, // gate_inp
-                    nullptr, // up_exps
-                    nullptr, // gate_exps
+                    model.layers[il].ffn_up_exps,
+                    model.layers[il].ffn_gate_exps,
                     model.layers[il].ffn_down_exps,
                     nullptr, // exp_probs_b (not used for gemma4)
                     n_expert, n_expert_used,
@@ -296,8 +332,8 @@ llama_model_gemma4::graph::graph(const llama_model & model, const llm_graph_para
                     LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX,
                     il, logits,
                     model.layers[il].ffn_gate_up_exps,
-                    nullptr, // up_exps_s
-                    nullptr, // gate_exps_s
+                    model.layers[il].ffn_up_exps_s,
+                    model.layers[il].ffn_gate_exps_s,
                     model.layers[il].ffn_down_exps_s);
             cur_moe = build_norm(cur_moe,
                     model.layers[il].ffn_post_norm_2, nullptr,
@@ -336,10 +372,10 @@ llama_model_gemma4::graph::graph(const llama_model & model, const llm_graph_para
             cur = build_lora_mm(model.layers[il].per_layer_inp_gate, cur); // [n_embd_per_layer, n_tokens]
             cur = ggml_gelu(ctx0, cur);
 
-            ggml_tensor * inp_this_layer = ggml_view_2d_slice(ctx0, inp_per_layer, il); // [n_embd_per_layer, n_tokens]
+            ggml_tensor * inp_this_layer = gemma4_view_2d_slice(ctx0, inp_per_layer, il); // [n_embd_per_layer, n_tokens]
 
             // TODO @ngxson : improve this
-            if (il == n_layer - 1 && inp_out_ids) {
+            if (il == n_layer - 1 && inp_out_ids && cparams.embeddings_nextn_masked) {
                 inp_this_layer = ggml_get_rows(ctx0, inp_this_layer, inp_out_ids);
             }
 
@@ -370,11 +406,22 @@ llama_model_gemma4::graph::graph(const llama_model & model, const llm_graph_para
             model.output_norm, nullptr,
             LLM_NORM_RMS, -1);
 
+    // Expose the post-output-norm hidden state (the LM-head input feature) so that
+    // MTP draft contexts can read it via llama_get_embeddings_nextn_ith() as the
+    // recurrent h input. This matches the reference (transformers/vLLM/SGLang),
+    // which feeds the drafter the target's post-final-norm hidden state.
+    cb(cur, "h_nextn", -1);
+    res->t_h_nextn = cur;
+
+    if (!cparams.embeddings_nextn_masked && inp_out_ids) {
+        cur = ggml_get_rows(ctx0, cur, inp_out_ids);
+    }
+
     cb(cur, "result_norm", -1);
     res->t_embd = cur;
 
     // lm_head
-    cur = build_lora_mm(model.output, cur);
+    cur = build_lora_mm(model.output, cur, model.output_s);
 
     if (hparams.f_final_logit_softcapping) {
         cur = ggml_scale(ctx0, cur, 1.0f / hparams.f_final_logit_softcapping);

@@ -3,70 +3,80 @@
 #include "quantize.cuh"
 #include "mmid.cuh"
 
+#include <cstdint>
+#include <new>
+
+template <bool use_x_map>
 static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) {
     switch (args.type_x) {
         case GGML_TYPE_Q1_0:
-            mul_mat_q_case<GGML_TYPE_Q1_0>(ctx, args, stream);
+            mul_mat_q_case<GGML_TYPE_Q1_0, use_x_map>(ctx, args, stream);
+            break;
+        case GGML_TYPE_Q2_0:
+            mul_mat_q_case<GGML_TYPE_Q2_0, use_x_map>(ctx, args, stream);
             break;
         case GGML_TYPE_Q4_0:
-            mul_mat_q_case<GGML_TYPE_Q4_0>(ctx, args, stream);
+            mul_mat_q_case<GGML_TYPE_Q4_0, use_x_map>(ctx, args, stream);
             break;
         case GGML_TYPE_Q4_1:
-            mul_mat_q_case<GGML_TYPE_Q4_1>(ctx, args, stream);
+            mul_mat_q_case<GGML_TYPE_Q4_1, use_x_map>(ctx, args, stream);
             break;
         case GGML_TYPE_Q5_0:
-            mul_mat_q_case<GGML_TYPE_Q5_0>(ctx, args, stream);
+            mul_mat_q_case<GGML_TYPE_Q5_0, use_x_map>(ctx, args, stream);
             break;
         case GGML_TYPE_Q5_1:
-            mul_mat_q_case<GGML_TYPE_Q5_1>(ctx, args, stream);
+            mul_mat_q_case<GGML_TYPE_Q5_1, use_x_map>(ctx, args, stream);
             break;
         case GGML_TYPE_Q8_0:
-            mul_mat_q_case<GGML_TYPE_Q8_0>(ctx, args, stream);
+            mul_mat_q_case<GGML_TYPE_Q8_0, use_x_map>(ctx, args, stream);
             break;
-        case GGML_TYPE_MXFP4:
-            mul_mat_q_case<GGML_TYPE_MXFP4>(ctx, args, stream);
-            break;
-        case GGML_TYPE_NVFP4:
-            mul_mat_q_case<GGML_TYPE_NVFP4>(ctx, args, stream);
-            break;
+// -----------------------------------------------------------------------
         case GGML_TYPE_Q2_K:
-            mul_mat_q_case<GGML_TYPE_Q2_K>(ctx, args, stream);
+            mul_mat_q_case<GGML_TYPE_Q2_K, use_x_map>(ctx, args, stream);
             break;
         case GGML_TYPE_Q3_K:
-            mul_mat_q_case<GGML_TYPE_Q3_K>(ctx, args, stream);
+            mul_mat_q_case<GGML_TYPE_Q3_K, use_x_map>(ctx, args, stream);
             break;
         case GGML_TYPE_Q4_K:
-            mul_mat_q_case<GGML_TYPE_Q4_K>(ctx, args, stream);
+            mul_mat_q_case<GGML_TYPE_Q4_K, use_x_map>(ctx, args, stream);
             break;
         case GGML_TYPE_Q5_K:
-            mul_mat_q_case<GGML_TYPE_Q5_K>(ctx, args, stream);
+            mul_mat_q_case<GGML_TYPE_Q5_K, use_x_map>(ctx, args, stream);
             break;
         case GGML_TYPE_Q6_K:
-            mul_mat_q_case<GGML_TYPE_Q6_K>(ctx, args, stream);
+            mul_mat_q_case<GGML_TYPE_Q6_K, use_x_map>(ctx, args, stream);
+            break;
+// -----------------------------------------------------------------------
+        case GGML_TYPE_IQ1_S:
+            mul_mat_q_case<GGML_TYPE_IQ1_S, use_x_map>(ctx, args, stream);
             break;
         case GGML_TYPE_IQ2_XXS:
-            mul_mat_q_case<GGML_TYPE_IQ2_XXS>(ctx, args, stream);
+            mul_mat_q_case<GGML_TYPE_IQ2_XXS, use_x_map>(ctx, args, stream);
             break;
         case GGML_TYPE_IQ2_XS:
-            mul_mat_q_case<GGML_TYPE_IQ2_XS>(ctx, args, stream);
+            mul_mat_q_case<GGML_TYPE_IQ2_XS, use_x_map>(ctx, args, stream);
             break;
         case GGML_TYPE_IQ2_S:
-            mul_mat_q_case<GGML_TYPE_IQ2_S>(ctx, args, stream);
+            mul_mat_q_case<GGML_TYPE_IQ2_S, use_x_map>(ctx, args, stream);
             break;
         case GGML_TYPE_IQ3_XXS:
-            mul_mat_q_case<GGML_TYPE_IQ3_XXS>(ctx, args, stream);
+            mul_mat_q_case<GGML_TYPE_IQ3_XXS, use_x_map>(ctx, args, stream);
             break;
         case GGML_TYPE_IQ3_S:
-            mul_mat_q_case<GGML_TYPE_IQ3_S>(ctx, args, stream);
-            break;
-        case GGML_TYPE_IQ1_S:
-            mul_mat_q_case<GGML_TYPE_IQ1_S>(ctx, args, stream);
+            mul_mat_q_case<GGML_TYPE_IQ3_S, use_x_map>(ctx, args, stream);
             break;
         case GGML_TYPE_IQ4_XS:
-            mul_mat_q_case<GGML_TYPE_IQ4_XS>(ctx, args, stream);
+            mul_mat_q_case<GGML_TYPE_IQ4_XS, use_x_map>(ctx, args, stream);
             break;
         case GGML_TYPE_IQ4_NL:
-            mul_mat_q_case<GGML_TYPE_IQ4_NL>(ctx, args, stream);
+            mul_mat_q_case<GGML_TYPE_IQ4_NL, use_x_map>(ctx, args, stream);
+            break;
+// -----------------------------------------------------------------------
+        case GGML_TYPE_MXFP4:
+            mul_mat_q_case<GGML_TYPE_MXFP4, use_x_map>(ctx, args, stream);
+            break;
+        case GGML_TYPE_NVFP4:
+            mul_mat_q_case<GGML_TYPE_NVFP4, use_x_map>(ctx, args, stream);
             break;
         default:
             GGML_ABORT("fatal error");
@@ -74,8 +84,11 @@ static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, con
     }
 }
 
-void ggml_cuda_mul_mat_q(
-        ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst) {
+static void ggml_cuda_mul_mat_q_impl(
+        ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const void * src0_secondary,
+        const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
+        const int32_t * source_map, int32_t source_split,
+        const int32_t * source_wait_class, const uint32_t * stage_ready) {
     GGML_ASSERT(        src1->type == GGML_TYPE_F32);
     GGML_ASSERT(        dst->type  == GGML_TYPE_F32);
     GGML_ASSERT(!ids || ids->type  == GGML_TYPE_I32); // Optional, used for batched GGML_MUL_MAT_ID.
@@ -93,6 +106,8 @@ void ggml_cuda_mul_mat_q(
     GGML_ASSERT(        nb10       == ts_src1);
     GGML_ASSERT(        nb0        == ts_dst);
     GGML_ASSERT(!ids || ids->nb[0] == ggml_type_size(ids->type));
+    GGML_ASSERT((source_map == nullptr) == (src0_secondary == nullptr));
+    GGML_ASSERT(source_map == nullptr || (ids != nullptr && source_split > 0));
 
     const char  * src0_d = (const char  *) src0->data;
     const float * src1_d = (const float *) src1->data;
@@ -118,24 +133,32 @@ void ggml_cuda_mul_mat_q(
     const int64_t s03 = src0->nb[3] / ts_src0;
     const int64_t s3  =  dst->nb[3] / ts_dst;
 
-    const bool use_stream_k = (GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_VOLTA)
-                            || GGML_CUDA_CC_IS_CDNA(cc);
+    const bool fallback = ne01 % 128 != 0;
+    const int mmq_max_tile_y = ggml_cuda_mmq_get_J_max(src0->type, fallback, cc);
+    GGML_ASSERT(mmq_max_tile_y > 0);
 
-    // TODO: tighter pool buffer size vs q8 path
     const bool use_native_fp4 = blackwell_mma_available(cc) && (src0->type == GGML_TYPE_MXFP4 || src0->type == GGML_TYPE_NVFP4);
+    const size_t y_block_size       = use_native_fp4 ? sizeof(block_fp4_mmq) : sizeof(block_q8_1_mmq);
+    const size_t y_values_per_block = use_native_fp4 ? QK_FP4_MMQ            : QK8_1_MMQ;
 
     if (!ids) {
-        const size_t nbytes_src1_q8_1 = ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1 +
-            get_mmq_x_max_host(cc)*sizeof(block_q8_1_mmq);
+        const size_t nbytes_src1_q8_1 = ne13*ne12 * ne11*ne10_padded * y_block_size/y_values_per_block +
+            mmq_max_tile_y * sizeof(block_q8_1_mmq);
         ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), nbytes_src1_q8_1);
+        ggml_cuda_pool_alloc<float> src1_scale(ctx.pool());
+        if (src0->type == GGML_TYPE_NVFP4 && use_native_fp4) {
+            src1_scale.alloc(ne13*ne12*ne11 + mmq_max_tile_y);
+        }
 
         {
             const int64_t s11 = src1->nb[1] / ts_src1;
             const int64_t s12 = src1->nb[2] / ts_src1;
             const int64_t s13 = src1->nb[3] / ts_src1;
             if (use_native_fp4) {
+                static constexpr size_t align_float8 = 32;
+                const bool use_aligned_float8 = ggml_cuda_is_aligned(src1, align_float8);
                 static_assert(sizeof(block_fp4_mmq) == 4 * sizeof(block_q8_1));
-                quantize_mmq_fp4_cuda(src1_d, nullptr, src1_q8_1.get(), src0->type, ne10, s11, s12, s13, ne10_padded,
+                quantize_mmq_fp4_cuda(src1_d, nullptr, src1_q8_1.get(), src1_scale.ptr, src0->type, use_aligned_float8, ne10, s11, s12, s13, ne10_padded,
                                         ne11, ne12, ne13, stream);
 
             } else {
@@ -147,17 +170,18 @@ void ggml_cuda_mul_mat_q(
 
         // Stride depends on quantization format
         const int64_t s12 = use_native_fp4 ?
-                                ne11 * ne10_padded * sizeof(block_fp4_mmq) / (QK_K * sizeof(int)) :  // block_fp4_mmq holds 256 values
+                                ne11 * ne10_padded * sizeof(block_fp4_mmq) / (QK_FP4_MMQ * sizeof(int)) :
                                 ne11 * ne10_padded * sizeof(block_q8_1) / (QK8_1 * sizeof(int));
         const int64_t s13 = ne12*s12;
 
         const mmq_args args = {
             src0_d, src0->type, (const int *) src1_q8_1.ptr, nullptr, nullptr, dst_d,
+            src0->type == GGML_TYPE_NVFP4 && use_native_fp4 ? src1_scale.ptr : nullptr,
             ne00, ne01, ne1, s01, ne11, s1,
             ne02, ne12, s02, s12, s2,
             ne03, ne13, s03, s13, s3,
-            use_stream_k, ne1};
-        ggml_cuda_mul_mat_q_switch_type(ctx, args, stream);
+            ne1, ne1};
+        ggml_cuda_mul_mat_q_switch_type<false>(ctx, args, stream);
         return;
     }
 
@@ -168,10 +192,16 @@ void ggml_cuda_mul_mat_q(
     const int64_t n_expert_used = ids->ne[0];
     const int64_t ne_get_rows = ne12 * n_expert_used;
     GGML_ASSERT(ne1 == n_expert_used);
+    GGML_ASSERT(ne_get_rows > 0 && (uint64_t) ne_get_rows <= SIZE_MAX - (size_t) mmq_max_tile_y);
+    const size_t ne_get_rows_padded = (size_t) ne_get_rows + mmq_max_tile_y;
 
     ggml_cuda_pool_alloc<int32_t> ids_src1(ctx.pool(), ne_get_rows);
-    ggml_cuda_pool_alloc<int32_t> ids_dst(ctx.pool(), ne_get_rows);
+    ggml_cuda_pool_alloc<int32_t> ids_dst(ctx.pool(), ne_get_rows_padded);
     ggml_cuda_pool_alloc<int32_t> expert_bounds(ctx.pool(), ne02 + 1);
+
+    // gate/up activations are broadcast across experts (ne11 == 1): quantize each token once and
+    // scatter to its slots. ids_src1 then holds the inverse map (token slot -> compact row).
+    const bool dedup_bcast = ne11 == 1 && n_expert_used > 1;
 
     {
         GGML_ASSERT(ids->nb[0] == ggml_element_size(ids));
@@ -179,13 +209,17 @@ void ggml_cuda_mul_mat_q(
         const int sis1 = nb12 / nb11;
 
         ggml_cuda_launch_mm_ids_helper((const int32_t *) ids->data, ids_src1.get(), ids_dst.get(), expert_bounds.get(),
-            ne02, ne12, n_expert_used, ne11, si1, sis1, stream);
+            ne02, ne12, n_expert_used, ne11, si1, sis1, /*write_inverse =*/ dedup_bcast, stream);
         CUDA_CHECK(cudaGetLastError());
     }
 
-    const size_t nbytes_src1_q8_1 = ne12*n_expert_used*ne10_padded * sizeof(block_q8_1)/QK8_1 +
-        get_mmq_x_max_host(cc)*sizeof(block_q8_1_mmq);
+    const size_t nbytes_src1_q8_1 = ne12*n_expert_used*ne10_padded * y_block_size/y_values_per_block +
+        mmq_max_tile_y * sizeof(block_q8_1_mmq);
     ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), nbytes_src1_q8_1);
+    ggml_cuda_pool_alloc<float> src1_scale(ctx.pool());
+    if (src0->type == GGML_TYPE_NVFP4 && use_native_fp4) {
+        src1_scale.alloc(ne_get_rows_padded);
+    }
 
     const int64_t ne11_flat = ne12*n_expert_used;
     const int64_t ne12_flat = 1;
@@ -197,8 +231,18 @@ void ggml_cuda_mul_mat_q(
         const int64_t s13 = src1->nb[3] / ts_src1;
 
         if (use_native_fp4) {
-            quantize_mmq_fp4_cuda(src1_d, ids_src1.get(), src1_q8_1.get(), src0->type, ne10, s11, s12, s13,
-                                    ne10_padded, ne11_flat, ne12_flat, ne13_flat, stream);
+            static constexpr size_t align_float8 = 32;
+            const bool use_aligned_float8 = ggml_cuda_is_aligned(src1, align_float8);
+            if (dedup_bcast) {
+                quantize_scatter_mmq_fp4_cuda(src1_d, ids_src1.get(), src1_q8_1.get(), src1_scale.ptr, src0->type, use_aligned_float8, ne10,
+                                        /*stride_token=*/s12, ne10_padded, ne12, ne11_flat, n_expert_used, stream);
+            } else {
+                quantize_mmq_fp4_cuda(src1_d, ids_src1.get(), src1_q8_1.get(), src1_scale.ptr, src0->type, use_aligned_float8, ne10, s11, s12, s13,
+                                        ne10_padded, ne11_flat, ne12_flat, ne13_flat, stream);
+            }
+        } else if (dedup_bcast) {
+            quantize_scatter_mmq_q8_1_cuda(src1_d, ids_src1.get(), src1_q8_1.get(), src0->type, ne10,
+                                    /*stride_token=*/s12, ne10_padded, ne12, ne11_flat, n_expert_used, stream);
         } else {
             quantize_mmq_q8_1_cuda(src1_d, ids_src1.get(), src1_q8_1.get(), src0->type, ne10, s11, s12, s13,
                                    ne10_padded, ne11_flat, ne12_flat, ne13_flat, stream);
@@ -206,101 +250,236 @@ void ggml_cuda_mul_mat_q(
         CUDA_CHECK(cudaGetLastError());
     }
 
-    static_assert(QK_K == 8 * QK_MXFP4, "QK_K needs to be 8 * QK_MXFP4");
-    const int64_t s12 = use_native_fp4 ? ne11 * ne10_padded * sizeof(block_fp4_mmq) / (QK_K * sizeof(int)) :
+    static_assert(QK_FP4_MMQ == 8 * QK_MXFP4, "QK_FP4_MMQ needs to be 8 * QK_MXFP4");
+    const int64_t s12 = use_native_fp4 ? ne11 * ne10_padded * sizeof(block_fp4_mmq) / (QK_FP4_MMQ * sizeof(int)) :
                                          ne11 * ne10_padded * sizeof(block_q8_1) / (QK8_1 * sizeof(int));
     const int64_t s13 = ne12*s12;
 
+    // Each expert only sees ne12*n_expert_used/ne02 tokens on average.
+    // On RDNA3 and RDNA4 it is faster to pick the tile size against this value instead of ne12.
+    int64_t ncols_opt = ne12;
+    if (GGML_CUDA_CC_IS_RDNA3(cc) || GGML_CUDA_CC_IS_RDNA4(cc)) {
+        ncols_opt = (ne12*n_expert_used + ne02 - 1) / ne02;
+    }
+
     // Note that ne02 is used instead of ne12 because the number of y channels determines the z dimension of the CUDA grid.
-    const mmq_args args = {
+    mmq_args args = {
         src0_d, src0->type, (const int *) src1_q8_1.get(), ids_dst.get(), expert_bounds.get(), dst_d,
+        src1_scale.ptr,
         ne00, ne01, ne_get_rows, s01, ne_get_rows, s1,
         ne02, ne02, s02, s12, s2,
         ne03, ne13, s03, s13, s3,
-        use_stream_k, ne12};
+        ne12, ncols_opt};
 
-    ggml_cuda_mul_mat_q_switch_type(ctx, args, stream);
+    args.x_secondary = (const char *) src0_secondary;
+    args.x_channel_map = source_map;
+    args.x_channel_split = source_split;
+    args.x_wait_class = source_wait_class;
+    args.x_stage_ready = stage_ready;
+    if (source_map) {
+        ggml_cuda_mul_mat_q_switch_type<true>(ctx, args, stream);
+    } else {
+        ggml_cuda_mul_mat_q_switch_type<false>(ctx, args, stream);
+    }
 }
 
-void ggml_cuda_op_mul_mat_q(
-    ggml_backend_cuda_context & ctx,
-    const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, const char * src0_dd_i, const float * src1_ddf_i,
-    const char * src1_ddq_i, float * dst_dd_i, const int64_t row_low, const int64_t row_high, const int64_t src1_ncols,
-    const int64_t src1_padded_row_size, cudaStream_t stream) {
-
-    const int64_t ne00 = src0->ne[0];
-
-    const int64_t ne10 = src1->ne[0];
-    const int64_t ne11 = src1->ne[1];
-    GGML_ASSERT(ne10 % QK8_1 == 0);
-
-    const int64_t ne0 = dst->ne[0];
-
-    const int64_t row_diff = row_high - row_low;
-    const int64_t stride01 = ne00 / ggml_blck_size(src0->type);
-
-    const int id = ggml_cuda_get_device();
-    const int cc = ggml_cuda_info().devices[id].cc;
-
-    // the main device has a larger memory buffer to hold the results from all GPUs
-    // nrows_dst == nrows of the matrix that the kernel writes into
-    const int64_t nrows_dst = id == ctx.device ? ne0 : row_diff;
-
-    // The stream-k decomposition is only faster for recent NVIDIA GPUs.
-    // Also its fixup needs to allocate a temporary buffer in the memory pool.
-    // There are multiple parallel CUDA streams for src1_ncols != ne11 which would introduce a race condition for this buffer.
-    const bool use_stream_k = ((GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_VOLTA)
-                            || GGML_CUDA_CC_IS_CDNA(cc))
-                            && src1_ncols == ne11;
-    const mmq_args args = {
-        src0_dd_i, src0->type, (const int *) src1_ddq_i, nullptr, nullptr, dst_dd_i,
-        ne00, row_diff, src1_ncols, stride01, ne11, nrows_dst,
-        1, 1, 0, 0, 0,
-        1, 1, 0, 0, 0,
-        use_stream_k, src1_ncols};
-
-    ggml_cuda_mul_mat_q_switch_type(ctx, args, stream);
-
-    GGML_UNUSED_VARS(src1, dst, src1_ddf_i, src1_padded_row_size);
+void ggml_cuda_mul_mat_q(
+        ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
+        const ggml_tensor * ids, ggml_tensor * dst) {
+    ggml_cuda_mul_mat_q_impl(ctx, src0, nullptr, src1, ids, dst, nullptr, 0, nullptr, nullptr);
 }
 
-bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t n_experts) {
+void ggml_cuda_mul_mat_q_mapped(
+        ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const void * src0_secondary,
+        const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
+        const int32_t * source_map, int32_t source_split,
+        const int32_t * source_wait_class, const uint32_t * stage_ready) {
+    GGML_ASSERT(src0_secondary != nullptr && source_map != nullptr && source_split > 0);
+    GGML_ASSERT((source_wait_class == nullptr) == (stage_ready == nullptr));
+    GGML_ASSERT(src0->type != GGML_TYPE_MXFP4 && src0->type != GGML_TYPE_NVFP4);
+    ggml_cuda_mul_mat_q_impl(
+        ctx, src0, src0_secondary, src1, ids, dst,
+        source_map, source_split, source_wait_class, stage_ready);
+}
+
+struct ggml_cuda_mmq_mmid_prepared {
+    explicit ggml_cuda_mmq_mmid_prepared(ggml_cuda_pool & pool) :
+        ids_src1(pool), ids_dst(pool), expert_bounds(pool), src1_q8_1(pool), src1_scale(pool) {
+    }
+
+    ggml_cuda_pool_alloc<int32_t> ids_src1;
+    ggml_cuda_pool_alloc<int32_t> ids_dst;
+    ggml_cuda_pool_alloc<int32_t> expert_bounds;
+    ggml_cuda_pool_alloc<char> src1_q8_1;
+    ggml_cuda_pool_alloc<float> src1_scale;
+    mmq_args args = {};
+    int64_t n_experts = 0;
+};
+
+ggml_cuda_mmq_mmid_prepared * ggml_cuda_mmq_mmid_prepare(
+        ggml_backend_cuda_context & ctx,
+        const ggml_tensor * src0,
+        const ggml_tensor * src1,
+        const ggml_tensor * ids,
+        ggml_tensor * dst) {
+    if (src0 == nullptr || src1 == nullptr || ids == nullptr || dst == nullptr ||
+            src1->type != GGML_TYPE_F32 || ids->type != GGML_TYPE_I32 || dst->type != GGML_TYPE_F32 ||
+            src0->type == GGML_TYPE_MXFP4 || src0->type == GGML_TYPE_NVFP4) {
+        return nullptr;
+    }
+
+    GGML_TENSOR_BINARY_OP_LOCALS;
+    if (ne13 != 1 || nb12 % nb11 != 0 || nb2 % nb1 != 0 || ids->nb[0] != ggml_element_size(ids)) {
+        return nullptr;
+    }
+
+    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+    const bool fallback = ne01 % 128 != 0;
+    const int mmq_max_tile_y = ggml_cuda_mmq_get_J_max(src0->type, fallback, cc);
+    const int64_t n_expert_used = ids->ne[0];
+    const int64_t ne_get_rows = ne12 * n_expert_used;
+    if (mmq_max_tile_y <= 0 || ne1 != n_expert_used || ne_get_rows <= 0 ||
+            static_cast<uint64_t>(ne_get_rows) > SIZE_MAX - static_cast<size_t>(mmq_max_tile_y)) {
+        return nullptr;
+    }
+
+    auto * prepared = new (std::nothrow) ggml_cuda_mmq_mmid_prepared(ctx.pool());
+    if (prepared == nullptr) {
+        return nullptr;
+    }
+    const size_t ne_get_rows_padded = static_cast<size_t>(ne_get_rows) + mmq_max_tile_y;
+    prepared->ids_src1.alloc(ne_get_rows);
+    prepared->ids_dst.alloc(ne_get_rows_padded);
+    prepared->expert_bounds.alloc(ne02 + 1);
+
+    const int si1 = ids->nb[1] / ggml_element_size(ids);
+    const int sis1 = nb12 / nb11;
+    const bool dedup_bcast = ne11 == 1 && n_expert_used > 1;
+    ggml_cuda_launch_mm_ids_helper(
+        static_cast<const int32_t *>(ids->data), prepared->ids_src1.get(), prepared->ids_dst.get(),
+        prepared->expert_bounds.get(), ne02, ne12, n_expert_used, ne11, si1, sis1, dedup_bcast, ctx.stream());
+    CUDA_CHECK(cudaGetLastError());
+
+    const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
+    const size_t nbytes_src1_q8_1 = ne12*n_expert_used*ne10_padded * sizeof(block_q8_1_mmq)/QK8_1_MMQ +
+        mmq_max_tile_y * sizeof(block_q8_1_mmq);
+    prepared->src1_q8_1.alloc(nbytes_src1_q8_1);
+
+    const float * src1_d = static_cast<const float *>(src1->data);
+    const int64_t s11 = src1->nb[1] / ggml_type_size(src1->type);
+    const int64_t s12_src = src1->nb[2] / ggml_type_size(src1->type);
+    const int64_t s13_src = src1->nb[3] / ggml_type_size(src1->type);
+    const int64_t ne11_flat = ne12 * n_expert_used;
+    if (dedup_bcast) {
+        quantize_scatter_mmq_q8_1_cuda(
+            src1_d, prepared->ids_src1.get(), prepared->src1_q8_1.get(), src0->type,
+            ne10, s12_src, ne10_padded, ne12, ne11_flat, n_expert_used, ctx.stream());
+    } else {
+        quantize_mmq_q8_1_cuda(
+            src1_d, prepared->ids_src1.get(), prepared->src1_q8_1.get(), src0->type,
+            ne10, s11, s12_src, s13_src, ne10_padded, ne11_flat, 1, 1, ctx.stream());
+    }
+    CUDA_CHECK(cudaGetLastError());
+
+    const int64_t ts_src0 = ggml_type_size(src0->type);
+    const int64_t ts_dst = ggml_type_size(dst->type);
+    const int64_t s01 = src0->nb[1] / ts_src0;
+    const int64_t s1 = dst->nb[1] / ts_dst;
+    const int64_t s02 = src0->nb[2] / ts_src0;
+    const int64_t s2 = dst->nb[2] / ts_dst;
+    const int64_t s03 = src0->nb[3] / ts_src0;
+    const int64_t s3 = dst->nb[3] / ts_dst;
+    const int64_t s12 = ne11 * ne10_padded * sizeof(block_q8_1) / (QK8_1 * sizeof(int));
+    const int64_t s13 = ne12 * s12;
+    int64_t ncols_opt = ne12;
+    if (GGML_CUDA_CC_IS_RDNA3(cc) || GGML_CUDA_CC_IS_RDNA4(cc)) {
+        ncols_opt = (ne12*n_expert_used + ne02 - 1) / ne02;
+    }
+
+    prepared->args = {
+        static_cast<const char *>(src0->data), src0->type,
+        reinterpret_cast<const int *>(prepared->src1_q8_1.get()),
+        prepared->ids_dst.get(), prepared->expert_bounds.get(), static_cast<float *>(dst->data), nullptr,
+        ne00, ne01, ne_get_rows, s01, ne_get_rows, s1,
+        ne02, ne02, s02, s12, s2,
+        ne03, ne13, s03, s13, s3,
+        ne12, ncols_opt,
+    };
+    prepared->n_experts = ne02;
+    return prepared;
+}
+
+bool ggml_cuda_mmq_mmid_launch_range(
+        ggml_backend_cuda_context & ctx,
+        const ggml_cuda_mmq_mmid_prepared * prepared,
+        const void * resident_data,
+        const void * staging_data,
+        const int32_t * source_map,
+        int32_t source_split,
+        int32_t expert_begin,
+        int32_t expert_count) {
+    if (prepared == nullptr || resident_data == nullptr || staging_data == nullptr || source_map == nullptr ||
+            source_split <= 0 || expert_begin < 0 || expert_count <= 0 ||
+            static_cast<int64_t>(expert_begin) + expert_count > prepared->n_experts) {
+        return false;
+    }
+
+    mmq_args args = prepared->args;
+    args.x = static_cast<const char *>(resident_data);
+    args.expert_bounds += expert_begin;
+    args.nchannels_x = expert_count;
+    args.nchannels_y = expert_count;
+    args.x_secondary = static_cast<const char *>(staging_data);
+    args.x_channel_map = source_map + expert_begin;
+    args.x_channel_split = source_split;
+    ggml_cuda_mul_mat_q_switch_type<true>(ctx, args, ctx.stream());
+    return cudaGetLastError() == cudaSuccess;
+}
+
+void ggml_cuda_mmq_mmid_free(ggml_cuda_mmq_mmid_prepared * prepared) {
+    delete prepared;
+}
+
+static bool ggml_cuda_mmq_type_supported(enum ggml_type type) {
 #ifdef GGML_CUDA_FORCE_CUBLAS
     return false;
 #endif // GGML_CUDA_FORCE_CUBLAS
 
-    bool mmq_supported;
-
     switch (type) {
         case GGML_TYPE_Q1_0:
+        case GGML_TYPE_Q2_0:
         case GGML_TYPE_Q4_0:
         case GGML_TYPE_Q4_1:
         case GGML_TYPE_Q5_0:
         case GGML_TYPE_Q5_1:
         case GGML_TYPE_Q8_0:
-        case GGML_TYPE_MXFP4:
-        case GGML_TYPE_NVFP4:
+// -------------------------------------------------
         case GGML_TYPE_Q2_K:
         case GGML_TYPE_Q3_K:
         case GGML_TYPE_Q4_K:
         case GGML_TYPE_Q5_K:
         case GGML_TYPE_Q6_K:
+// -------------------------------------------------
+        case GGML_TYPE_IQ1_S:
         case GGML_TYPE_IQ2_XXS:
         case GGML_TYPE_IQ2_XS:
         case GGML_TYPE_IQ2_S:
         case GGML_TYPE_IQ3_XXS:
         case GGML_TYPE_IQ3_S:
-        case GGML_TYPE_IQ1_S:
         case GGML_TYPE_IQ4_XS:
         case GGML_TYPE_IQ4_NL:
-            mmq_supported = true;
-            break;
+// -------------------------------------------------
+        case GGML_TYPE_MXFP4:
+        case GGML_TYPE_NVFP4:
+            return true;
         default:
-            mmq_supported = false;
-            break;
+            return false;
     }
+}
 
-    if (!mmq_supported) {
+static bool ggml_cuda_should_use_mmq_impl(enum ggml_type type, int cc, int64_t ne11, int64_t n_experts, size_t smpbo) {
+    // MMQ tiles require at least 48 KiB per-block shared memory; fall back to BLAS otherwise.
+    if (smpbo < 48 * 1024) {
         return false;
     }
 
@@ -309,7 +488,9 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
     }
 
     if (ggml_cuda_highest_compiled_arch(cc) < GGML_CUDA_CC_DP4A) {
-        return false;
+        // for MoE, mmq is faster even without native dp4a
+        // TODO: check if cards older than pascal might benefit from this as well
+        return cc >= GGML_CUDA_CC_PASCAL && n_experts > 0;
     }
 
 #ifdef GGML_CUDA_FORCE_MMQ
@@ -368,5 +549,27 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
         return true;
     }
 
+    // gfx900 (Vega 10), gfx909, and gfx90c lack native dp4a, losing to dequant + hipBLAS
+    // for dense matrices; keep MMQ only for MoE, where the
+    // hipBLAS path is much slower.
+    if (cc == GGML_CUDA_CC_VEGA || GGML_CUDA_CC_IS_GCN_APU(cc)) {
+        return n_experts > 0;
+    }
+
     return (!GGML_CUDA_CC_IS_CDNA(cc)) || ne11 < MMQ_DP4A_MAX_BATCH_SIZE;
+}
+
+bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t n_experts) {
+    if (!ggml_cuda_mmq_type_supported(type)) {
+        return false;
+    }
+    const int id = ggml_cuda_get_device();
+    return ggml_cuda_should_use_mmq_impl(type, cc, ne11, n_experts, ggml_cuda_info().devices[id].smpbo);
+}
+
+bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t n_experts, size_t smpbo) {
+    if (!ggml_cuda_mmq_type_supported(type)) {
+        return false;
+    }
+    return ggml_cuda_should_use_mmq_impl(type, cc, ne11, n_experts, smpbo);
 }

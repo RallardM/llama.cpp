@@ -25,8 +25,30 @@ public:
                      uint32_t   n_seq_max,
                      uint32_t   n_ubatch,
                      uint32_t   n_pad,
+               llama_memory_t   mem_other,
         const layer_filter_cb & filter,
-        const  layer_reuse_cb & reuse);
+        const  layer_reuse_cb & reuse,
+        const  layer_share_cb & share,
+        llama_memory_placement_options placement);
+
+    llama_kv_cache_iswa(
+            const llama_model & model,
+            const llama_hparams & hparams,
+                    ggml_type   type_k,
+                    ggml_type   type_v,
+                         bool   v_trans,
+                         bool   offload,
+                         bool   swa_full,
+                         bool   unified,
+                     uint32_t   kv_size,
+                     uint32_t   n_seq_max,
+                     uint32_t   n_ubatch,
+                     uint32_t   n_pad,
+               llama_memory_t   mem_other,
+        const layer_filter_cb & filter,
+        const  layer_reuse_cb & reuse,
+        const  layer_share_cb & share,
+        llama_memory_placement_options placement);
 
     ~llama_kv_cache_iswa() = default;
 
@@ -41,9 +63,15 @@ public:
 
     llama_memory_context_ptr init_full() override;
 
+    llama_memory_context_ptr init_reserve(uint32_t n_kv) override;
+
+    uint32_t get_attn_reserve_capacity() const override;
+
     llama_memory_context_ptr init_update(llama_context * lctx, bool optimize) override;
 
     bool get_can_shift() const override;
+    bool can_decode_sampled() const override;
+    void seq_set_last_token(llama_seq_id seq_id, llama_pos pos, llama_token token) override;
 
     void clear(bool data) override;
 
@@ -71,8 +99,6 @@ public:
     llama_kv_cache * get_swa () const;
 
 private:
-    const llama_hparams & hparams;
-
     const bool unified;
 
     std::unique_ptr<llama_kv_cache> kv_base;
@@ -89,6 +115,10 @@ public:
     // used to create a full-cache context
     llama_kv_cache_iswa_context(
             llama_kv_cache_iswa * kv);
+
+    llama_kv_cache_iswa_context(
+            llama_kv_cache_iswa * kv,
+            uint32_t n_kv);
 
     // used to create an update context
     llama_kv_cache_iswa_context(
@@ -114,6 +144,7 @@ public:
 
     llama_memory_status  get_status() const override;
     const llama_ubatch & get_ubatch() const override;
+    uint32_t get_attn_reserve_n_kv() const override;
 
     //
     // llama_kv_cache_iswa_context specific API

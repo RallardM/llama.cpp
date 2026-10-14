@@ -2,12 +2,14 @@
 
 #include <cstdint>
 #include <memory>
+#include <utility>
 #include <vector>
 #include <cstdio>
 
 struct llama_file;
 struct llama_mmap;
 struct llama_mlock;
+struct ggml_tensor;
 
 using llama_files  = std::vector<std::unique_ptr<llama_file>>;
 using llama_mmaps  = std::vector<std::unique_ptr<llama_mmap>>;
@@ -41,14 +43,22 @@ private:
 };
 
 struct llama_mmap {
+    // list of [first, last) byte ranges within a file
+    using ranges = std::vector<std::pair<size_t, size_t>>;
+
     llama_mmap(const llama_mmap &) = delete;
-    llama_mmap(struct llama_file * file, size_t prefetch = (size_t) -1, bool numa = false);
+    llama_mmap(struct llama_file * file, size_t prefetch = (size_t) -1, bool numa = false,
+               const ranges & lazy_ranges = {});
     ~llama_mmap();
 
     size_t size() const;
     void * addr() const;
 
     void unmap_fragment(size_t first, size_t last);
+
+    void prefetch_rows(const void * data, size_t row_size, const int32_t * rows, size_t n_rows) const;
+    bool contains_lazy(const void * data, size_t bytes) const;
+    void prefetch_rows(const ggml_tensor * tensor, const ggml_tensor * indices) const;
 
     static const bool SUPPORTED;
 

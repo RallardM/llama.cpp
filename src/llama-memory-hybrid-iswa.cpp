@@ -18,13 +18,15 @@ llama_memory_hybrid_iswa::llama_memory_hybrid_iswa(
                  uint32_t   kv_size,
                  uint32_t   n_ubatch,
                  uint32_t   n_pad,
+                     bool   offload_attn,
+ llama_memory_placement_options placement,
                             /* recurrent */
                 ggml_type   type_r,
                 ggml_type   type_s,
                  uint32_t   rs_size,
                             /* common */
                  uint32_t   n_seq_max,
-                     bool   offload,
+                 uint32_t   n_rs_seq,
                      bool   unified,
                             /* layer filters */
     const layer_filter_cb & filter_attn,
@@ -35,27 +37,31 @@ llama_memory_hybrid_iswa::llama_memory_hybrid_iswa(
         type_k,
         type_v,
         v_trans,
-        offload,
+        offload_attn,
         swa_full,
         unified,
         kv_size,
         n_seq_max,
         n_ubatch,
         n_pad,
+        nullptr,
         filter_attn == nullptr ?
-            [&](int32_t il) { return !hparams.is_recurrent(il); }
+            [&](int32_t il) { return !hparams.is_recr(il); }
             : filter_attn,
-        nullptr
+        nullptr,
+        nullptr,
+        placement
     )),
     mem_recr(new llama_memory_recurrent(
         model,
         type_r,
         type_s,
-        offload,
+        placement.recurrent_offload,
         rs_size,
         n_seq_max,
+        n_rs_seq,
         filter_recr == nullptr ?
-            [&](int32_t il) { return hparams.is_recurrent(il); }
+            [&](int32_t il) { return hparams.is_recr(il); }
             : filter_recr
     )) {}
 
@@ -75,7 +81,13 @@ llama_memory_context_ptr llama_memory_hybrid_iswa::init_batch(llama_batch_allocr
             } else {
                 // Use non-sequential split when KV cache is unified (needed for hellaswag/winogrande/multiple-choice)
                 const bool unified = (mem_attn->get_base()->get_n_stream() == 1);
-                ubatch = balloc.split_equal(n_ubatch, !unified);
+
+                // [TAG_RECURRENT_ROLLBACK_SPLITS]
+                // the trailing (1 + n_rs_seq) tokens of each seq must stay in the same ubatch
+                //   so that the rollback snapshots remain valid
+                const uint32_t n_rs_seq = mem_recr->n_rs_seq;
+
+                ubatch = balloc.split_equal(n_ubatch, !unified, n_rs_seq > 0 ? n_rs_seq + 1 : 0);
             }
 
             if (ubatch.n_tokens == 0) {
@@ -119,6 +131,14 @@ llama_memory_context_ptr llama_memory_hybrid_iswa::init_batch(llama_batch_allocr
 
 llama_memory_context_ptr llama_memory_hybrid_iswa::init_full() {
     return std::make_unique<llama_memory_hybrid_iswa_context>(this);
+}
+
+llama_memory_context_ptr llama_memory_hybrid_iswa::init_reserve(uint32_t n_kv) {
+    return std::make_unique<llama_memory_hybrid_iswa_context>(this, mem_attn->init_reserve(n_kv));
+}
+
+uint32_t llama_memory_hybrid_iswa::get_attn_reserve_capacity() const {
+    return mem_attn->get_attn_reserve_capacity();
 }
 
 llama_memory_context_ptr llama_memory_hybrid_iswa::init_update(llama_context * lctx, bool optimize) {
@@ -213,6 +233,14 @@ llama_memory_hybrid_iswa_context::llama_memory_hybrid_iswa_context(llama_memory_
 }
 
 llama_memory_hybrid_iswa_context::llama_memory_hybrid_iswa_context(
+              llama_memory_hybrid_iswa * mem,
+        llama_memory_context_ptr          ctx_attn) :
+    ctx_attn(std::move(ctx_attn)),
+    ctx_recr(mem->get_mem_recr()->init_full()),
+    status(llama_memory_status_combine(this->ctx_attn->get_status(), ctx_recr->get_status())) {
+}
+
+llama_memory_hybrid_iswa_context::llama_memory_hybrid_iswa_context(
         llama_memory_hybrid_iswa * mem,
                    llama_context * lctx,
                             bool   optimize) :
@@ -264,6 +292,10 @@ llama_memory_status llama_memory_hybrid_iswa_context::get_status() const {
 const llama_ubatch & llama_memory_hybrid_iswa_context::get_ubatch() const {
     assert(status == LLAMA_MEMORY_STATUS_SUCCESS);
     return ubatches[i_next];
+}
+
+uint32_t llama_memory_hybrid_iswa_context::get_attn_reserve_n_kv() const {
+    return ctx_attn->get_attn_reserve_n_kv();
 }
 
 const llama_kv_cache_iswa_context * llama_memory_hybrid_iswa_context::get_attn() const {

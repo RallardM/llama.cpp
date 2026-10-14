@@ -1,161 +1,192 @@
-// test-moe-cache: standalone correctness test for the MoE expert cache.
-//
-// This test does NOT exercise the larger llama.cpp graph; it pokes the cache
-// API directly to verify:
-//   1. acquire() returns a valid slot in [0, n_slots).
-//   2. After the workload, every (expert, slot) mapping in the cache points
-//      to a slot whose contents bit-match that expert's source data.
-//   3. hits + misses == total acquires.
-//   4. No expert is ever resident in two slots simultaneously.
-//   5. Hit rate for a Zipf-ish access pattern is non-trivial (>40%).
-//
-// The workload is a synthetic stand-in for MoE routing: most tokens land on a
-// hot subset of experts. Real Gemma 4 / Mixtral / Qwen3 routing has stronger
-// locality than this, so a passing test here is a lower bound.
+// MoE cache test runner and focused modes.
 
-#include "../ggml/src/ggml-cuda/moe-cache.cuh"
-
-#include <cuda_runtime.h>
-
-#include <algorithm>
-#include <cassert>
-#include <cmath>
-#include <cstdint>
-#include <cstdio>
-#include <cstdlib>
-#include <cstring>
-#include <random>
-#include <vector>
-
-#define CHECK(cond) do { \
-    if (!(cond)) { \
-        fprintf(stderr, "FAIL %s:%d  %s\n", __FILE__, __LINE__, #cond); \
-        std::exit(1); \
-    } \
-} while (0)
-
-#define CUDA_OK(x) do { \
-    cudaError_t e = (x); \
-    if (e != cudaSuccess) { \
-        fprintf(stderr, "FAIL %s:%d  cuda: %s\n", __FILE__, __LINE__, cudaGetErrorString(e)); \
-        std::exit(1); \
-    } \
-} while (0)
-
-static int sample_zipf(std::mt19937 & rng, int n, double s) {
-    // Rejection-sample a Zipf(s) over {0..n-1}. Cheap; fine for a test.
-    static thread_local std::vector<double> cdf;
-    if ((int)cdf.size() != n) {
-        cdf.assign(n, 0.0);
-        double sum = 0.0;
-        for (int i = 0; i < n; ++i) {
-            sum += 1.0 / std::pow((double)(i + 1), s);
-            cdf[i] = sum;
-        }
-        for (auto & v : cdf) v /= sum;
-    }
-    std::uniform_real_distribution<double> u(0.0, 1.0);
-    double r = u(rng);
-    auto it = std::lower_bound(cdf.begin(), cdf.end(), r);
-    return (int)(it - cdf.begin());
-}
+#include "test-moe-cache.h"
 
 int main(int argc, char ** argv) {
-    (void)argc; (void)argv;
-
-    // Toy parameters. Small enough to run in a few ms on any CUDA device,
-    // large enough that LRU has work to do.
-    constexpr int    N_EXPERTS = 64;
-    constexpr int    N_SLOTS   = 16;
-    constexpr size_t SLOT_BYTES = 1024;       // 256 floats
-    constexpr int    N_FLOATS  = SLOT_BYTES / sizeof(float);
-    constexpr int    N_ACCESS  = 4000;
-    constexpr double ZIPF_S    = 1.1;          // mild skew
-    constexpr unsigned SEED    = 0xC0FFEE;
+    test_moe_tensor_split_rejection();
+    if (argc == 2 && strcmp(argv[1], "--tensor-policy-only") == 0) {
+        return 0;
+    }
+    if (argc == 2 && strcmp(argv[1], "--grouped-multigpu-only") == 0) {
+        return test_grouped_multigpu();
+    }
+    if (argc == 2 && strcmp(argv[1], "--grouped-layer-only") == 0) {
+        test_grouped_layer_placement();
+        return 0;
+    }
+    if (argc == 2 && strcmp(argv[1], "--pageable-fallback-only") == 0) {
+        test_pageable_cache_fallback();
+        return 0;
+    }
+    if (argc == 2 && strcmp(argv[1], "--grouped-staging-bench") == 0) {
+        test_grouped_staging_benchmark();
+        return 0;
+    }
+    if (argc == 2 && strcmp(argv[1], "--early-grouped-only") == 0) {
+        test_early_grouped_graphs();
+        return 0;
+    }
+    if (argc == 2 && strcmp(argv[1], "--early-graph-only") == 0) {
+        ggml_cuda_moe_grouped_context context(nullptr, 0);
+        CHECK(ggml_cuda_moe_grouped_context_test_access::early_graph(context));
+        return 0;
+    }
+    if (argc == 2 && strcmp(argv[1], "--early-select-only") == 0) {
+        ggml_cuda_moe_grouped_context context(nullptr, 0);
+        CHECK(ggml_cuda_moe_grouped_context_test_access::early_select(context));
+        return 0;
+    }
+    if (argc == 2 && strcmp(argv[1], "--early-hc-only") == 0) {
+        ggml_cuda_moe_grouped_context context(nullptr, 0);
+        CHECK(ggml_cuda_moe_grouped_context_test_access::early_hc(context));
+        return 0;
+    }
+    if (argc == 2 && strcmp(argv[1], "--prepack-only") == 0) {
+        ggml_cuda_moe_grouped_context context(nullptr, -1);
+        CHECK(ggml_cuda_moe_grouped_context_test_access::prepack(context));
+        return 0;
+    }
+    if (argc == 2 && (strcmp(argv[1], "--early-copy-only") == 0 || strcmp(argv[1], "--early-copy-graph-only") == 0)) {
+        fprintf(stderr, "test-moe-cache: old copy transport retired; use --prepack-only\n");
+        return 1;
+    }
+    const bool registry_only = argc == 2 && strcmp(argv[1], "--registry-only") == 0;
+    const bool registry_bench = argc == 2 && strcmp(argv[1], "--registry-bench") == 0;
+    const bool cached_fusion_only = argc == 2 && strcmp(argv[1], "--cached-fusion-only") == 0;
+    const bool grouped_bench = argc == 2 && strcmp(argv[1], "--grouped-bench") == 0;
+    const bool grouped_decode_only = argc == 2 && strcmp(argv[1], "--grouped-decode-only") == 0;
+    const bool grouped_replay_only = argc == 2 && strcmp(argv[1], "--grouped-replay-only") == 0;
+    const bool grouped_multirow_only = argc == 2 && strcmp(argv[1], "--grouped-multirow-only") == 0;
+    const bool grouped_nvfp4_only = argc == 2 && strcmp(argv[1], "--grouped-nvfp4-only") == 0;
+    const bool legacy_phase_telemetry_only = argc == 2 && strcmp(argv[1], "--legacy-phase-telemetry-only") == 0;
+    const bool staging_pipeline_only = argc == 2 && strcmp(argv[1], "--staging-pipeline-only") == 0;
+    const bool gemma_q4_parity_only = argc == 2 && strcmp(argv[1], "--gemma-q4-parity-only") == 0;
+    const bool prefill_resident_only = argc == 2 && strcmp(argv[1], "--prefill-resident-only") == 0;
+    test_moe_cache_proc_api();
+    if (argc == 2 && strcmp(argv[1], "--pageable-aux-only") == 0) {
+        test_pageable_auxiliaries();
+        return 0;
+    }
+    if (argc == 2 && strcmp(argv[1], "--pageable-draft-lifecycle-only") == 0) {
+        test_pageable_separate_draft_lifecycle();
+        return 0;
+    }
+    if (argc == 2 && strcmp(argv[1], "--materialization-only") == 0) {
+        int dev = 0;
+        CUDA_OK(cudaGetDevice(&dev));
+        test_active_grouped_materialization();
+        test_grouped_graph_replay_lifecycle(dev, 0, 1, 256, true);
+        return 0;
+    }
+    if (argc == 2 && strcmp(argv[1], "--auto-pin-fallback-only") == 0) {
+        int dev = 0;
+        CUDA_OK(cudaGetDevice(&dev));
+        test_grouped_graph_replay_lifecycle(dev, 0, 0, 256, false, true);
+        return 0;
+    }
+    if (prefill_resident_only) {
+        test_prefill_resident_biases();
+        return 0;
+    }
+    if (gemma_q4_parity_only) {
+        int dev = 0;
+        CUDA_OK(cudaGetDevice(&dev));
+        test_gemma_q4_cached_cuda_parity(dev);
+        return 0;
+    }
+    if (argc == 2 && strcmp(argv[1], "--grouped-lookup-only") == 0) {
+        int dev = 0;
+        CUDA_OK(cudaGetDevice(&dev));
+        test_active_grouped_lookup_routes(dev);
+        return 0;
+    }
+    if (grouped_multirow_only) {
+        int dev = 0;
+        CUDA_OK(cudaGetDevice(&dev));
+        test_speculative_grouped_intent_splits();
+        test_graph_execution_certificate_policy();
+        test_speculative_required_grouped_backend_capability(dev);
+        test_active_grouped_multirow_graph_modes(dev);
+        return 0;
+    }
+    if (grouped_decode_only) {
+        int dev = 0;
+        CUDA_OK(cudaGetDevice(&dev));
+        test_grouped_decode(dev);
+        return 0;
+    }
+    if (grouped_replay_only) {
+        int dev = 0;
+        CUDA_OK(cudaGetDevice(&dev));
+        test_grouped_graph_replay_lifecycle(dev);
+        test_grouped_graph_replay_lifecycle(dev, 393216, 2);
+        test_grouped_graph_replay_lifecycle(dev, 524288, 1);
+        test_grouped_graph_replay_lifecycle(dev, 6 * 1024 * 1024, 2, 1024);
+        return 0;
+    }
+    if (grouped_nvfp4_only) {
+        test_active_grouped_nvfp4_scales();
+        return 0;
+    }
+    if (legacy_phase_telemetry_only) {
+        int dev = 0;
+        CUDA_OK(cudaGetDevice(&dev));
+        test_active_grouped_legacy_phase_telemetry(dev);
+        return 0;
+    }
+    if (staging_pipeline_only) {
+        int dev = 0;
+        CUDA_OK(cudaGetDevice(&dev));
+        test_pageable_staging_pipeline(dev);
+        return 0;
+    }
+    test_speculative_grouped_intent_splits();
+    test_candidate_graph_coverage_ledger();
+    test_candidate_graph_inventory_reuse();
+    test_mmid_capabilities();
+    test_scheduler_execution_certificate();
+    test_graph_execution_certificate_policy();
+    test_candidate_generic_physical_truth();
+    test_candidate_producer();
+    test_candidate_registry(registry_bench);
+    test_legacy_owner_leases();
+    test_grouped_context_resources();
+    test_grouped_graph_preflight(registry_bench);
+    test_grouped_graph_mixed_phase();
+    if (registry_only || registry_bench) {
+        return 0;
+    }
 
     int dev = 0;
     CUDA_OK(cudaGetDevice(&dev));
-    fprintf(stderr, "test-moe-cache: device=%d  experts=%d  slots=%d  slot=%zuB  ops=%d\n",
-            dev, N_EXPERTS, N_SLOTS, SLOT_BYTES, N_ACCESS);
-
-    // Pinned host source: expert i is filled with float value (float)i in every cell.
-    float * host_experts = nullptr;
-    CUDA_OK(cudaMallocHost(&host_experts, (size_t)N_EXPERTS * SLOT_BYTES));
-    for (int e = 0; e < N_EXPERTS; ++e) {
-        for (int j = 0; j < N_FLOATS; ++j) {
-            host_experts[e * N_FLOATS + j] = (float)e;
-        }
+    test_speculative_required_grouped_backend_capability(dev);
+    if (grouped_bench) {
+        test_grouped_decode(dev);
+        test_grouped_decode_benchmark(dev);
+        return 0;
     }
 
-    cudaStream_t copy_stream = nullptr;
-    CUDA_OK(cudaStreamCreateWithFlags(&copy_stream, cudaStreamNonBlocking));
-
-    auto * cache = ggml_cuda_moe_cache_init(dev, SLOT_BYTES, N_SLOTS);
-    CHECK(cache != nullptr);
-
-    std::mt19937 rng(SEED);
-    std::vector<int> trace; trace.reserve(N_ACCESS);
-
-    for (int t = 0; t < N_ACCESS; ++t) {
-        int eid = sample_zipf(rng, N_EXPERTS, ZIPF_S);
-        const void * src = host_experts + (size_t)eid * N_FLOATS;
-
-        int slot = ggml_cuda_moe_cache_acquire(cache, src, SLOT_BYTES, copy_stream);
-        CHECK(slot >= 0 && slot < N_SLOTS);
-        trace.push_back(eid);
+    test_moe_route_publication_lifetime();
+    test_cached_mmid_fusion_decline();
+    test_cached_mmid_prefill_and_overflow();
+    test_pageable_staging_pipeline(dev);
+    test_owner_legacy_cache(dev);
+    if (cached_fusion_only) {
+        test_cached_mmid_routed_separate_chain();
+        return 0;
     }
+    test_grouped_decode(dev);
+    test_grouped_graph_replay_lifecycle(dev);
+    test_grouped_graph_replay_lifecycle(dev, 0, 1, 256, true);
+    test_grouped_graph_replay_lifecycle(dev, 0, 0, 256, false, true);
+    test_grouped_graph_replay_lifecycle(dev, 393216, 2);
+    test_grouped_graph_replay_lifecycle(dev, 524288, 1);
+    test_grouped_graph_replay_lifecycle(dev, 6 * 1024 * 1024, 2, 1024);
+    test_strided_copy_graph_update(dev, false);
+    test_strided_copy_graph_update(dev, true);
+    test_active_grouped_multirow_graph_modes(dev);
+    test_active_grouped_dispatch();
 
-    // All copies must be done before we read slabs back.
-    CUDA_OK(cudaStreamSynchronize(copy_stream));
-
-    // --- Snapshot stats BEFORE the verification sweep so the workload-phase
-    // numbers aren't contaminated by sweep acquires. ---
-    uint64_t hits = 0, misses = 0, evictions = 0;
-    ggml_cuda_moe_cache_stats(cache, &hits, &misses, &evictions);
-    CHECK(hits + misses == (uint64_t)N_ACCESS);
-    double hit_rate = (double)hits / (double)N_ACCESS;
-
-    fprintf(stderr, "  workload hits=%llu  misses=%llu  hit-rate=%.2f%%  evictions=%llu\n",
-            (unsigned long long)hits,
-            (unsigned long long)misses,
-            100.0 * hit_rate,
-            (unsigned long long)evictions);
-
-    // Zipf(1.1) over 64 experts with 16 slots should easily clear 40% hit rate.
-    CHECK(hit_rate > 0.40);
-
-    // --- Verification sweep: re-acquire every expert and confirm slot
-    // contents are bit-exact. Sweep order = expert id ascending. The sweep
-    // mutates LRU but that's fine; we just want to walk every expert once.
-    // Re-acquire forces a fresh H2D copy on miss, which is correct because
-    // we're testing both hit and miss paths return correct data. ---
-    std::vector<float> readback(N_FLOATS);
-    int verified = 0;
-    for (int eid = 0; eid < N_EXPERTS; ++eid) {
-        const float * src = host_experts + (size_t)eid * N_FLOATS;
-        int slot = ggml_cuda_moe_cache_acquire(cache, src, SLOT_BYTES, copy_stream);
-        CHECK(slot >= 0 && slot < N_SLOTS);
-        CUDA_OK(cudaStreamSynchronize(copy_stream));
-
-        void * d = ggml_cuda_moe_cache_slot_ptr(cache, slot);
-        CHECK(d != nullptr);
-
-        CUDA_OK(cudaMemcpy(readback.data(), d, SLOT_BYTES, cudaMemcpyDeviceToHost));
-        for (int j = 0; j < N_FLOATS; ++j) {
-            CHECK(readback[j] == (float)eid);
-        }
-        verified++;
-    }
-    CHECK(verified == N_EXPERTS);
-
-    // Final stats sanity: hits + misses across both phases must match acquires.
-    ggml_cuda_moe_cache_stats(cache, &hits, &misses, &evictions);
-    CHECK(hits + misses == (uint64_t)(N_ACCESS + N_EXPERTS));
-
-    ggml_cuda_moe_cache_free(cache);
-    CUDA_OK(cudaStreamDestroy(copy_stream));
-    CUDA_OK(cudaFreeHost(host_experts));
-
-    fprintf(stderr, "test-moe-cache: OK\n");
+    test_cache_slots_and_staging(dev);
     return 0;
 }

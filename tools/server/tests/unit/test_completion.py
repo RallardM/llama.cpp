@@ -1,7 +1,10 @@
+import json
 import pytest
 import requests
 import time
 import random
+
+from concurrent.futures import ThreadPoolExecutor
 
 from openai import OpenAI
 from utils import *
@@ -66,6 +69,8 @@ def test_completion_stream(prompt: str, n_predict: int, re_content: str, n_promp
             assert server.n_predict is not None
             assert data["generation_settings"]["n_predict"] == min(n_predict, server.n_predict)
             assert data["generation_settings"]["seed"] == server.seed
+            assert "adaptive_target" in data["generation_settings"]
+            assert "adaptive_decay" in data["generation_settings"]
             assert match_regex(re_content, content)
         else:
             assert len(data["tokens"]) > 0
@@ -392,7 +397,12 @@ def test_completion_unified(n_ctx, n_slots, n_predict_vals, expected_success):
     results = parallel_function_calls(tasks)
     for res, n_predict, expect_ok in zip(results, n_predict_vals, expected_success):
         if expect_ok:
-            assert res.status_code == 200
+            # the pool is aborted as a whole, so a request that fits on its own
+            # is still dropped when the slots overlap, and it says so explicitly
+            assert res.status_code == 200 or (
+                res.status_code == 500
+                and "context size has been exceeded" in res.body["error"]["message"].lower()
+            )
 
         # note: https://github.com/ggml-org/llama.cpp/pull/18700#issuecomment-3728695581
         if res.status_code == 200:
@@ -491,29 +501,82 @@ def test_n_probs_post_sampling():
     global server
     server.start()
     res = server.make_request("POST", "/completion", data={
-        "prompt": "I believe the meaning of life is",
+        "prompt": "Today was the day. Today I would finally become a",
         "n_probs": 10,
-        "temperature": 0.0,
+        "temperature": 1.0,
         "n_predict": 5,
         "post_sampling_probs": True,
     })
     assert res.status_code == 200
     assert "completion_probabilities" in res.body
     assert len(res.body["completion_probabilities"]) == 5
-    for tok in res.body["completion_probabilities"]:
+    for (i, tok) in enumerate(res.body["completion_probabilities"]):
         assert "id" in tok and tok["id"] > 0
         assert "token" in tok and type(tok["token"]) == str
         assert "prob" in tok and 0.0 < tok["prob"] <= 1.0
         assert "bytes" in tok and type(tok["bytes"]) == list
-        assert len(tok["top_probs"]) == 10
+        assert "top_probs" in tok and type(tok["top_probs"]) == list
+
         for prob in tok["top_probs"]:
             assert "id" in prob and prob["id"] > 0
             assert "token" in prob and type(prob["token"]) == str
-            assert "prob" in prob and 0.0 <= prob["prob"] <= 1.0
+            # 0.0 probability tokens should never be returned by the server
+            assert "prob" in prob and 0.0 < prob["prob"] <= 1.0
             assert "bytes" in prob and type(prob["bytes"]) == list
-        # because the test model usually output token with either 100% or 0% probability, we need to check all the top_probs
-        assert any(prob["prob"] == 1.0 for prob in tok["top_probs"])
 
+        if i == 0:
+            # The prompt is vague enough that we should get at least 10 possibilities
+            # for the first token.
+            assert len(tok["top_probs"]) == 10
+
+        if len(tok["top_probs"]) < 10:
+            # Getting less than the requested number of probabilities should only happen
+            # if the ones we did get already sum to 1.0.
+            assert sum(p["prob"] for p in tok["top_probs"]) == pytest.approx(1.0)
+
+def test_n_probs_post_backend_sampling():
+    """Verify that the same probabilities are returned with and without backend sampling."""
+    global server
+    server.backend_sampling = True
+    server.start()
+
+    def make_request(backend_sampling):
+        n_predict = 20
+
+        res = server.make_request("POST", "/completion", data={
+            "prompt": "The countries of Europe, in random order, are:",
+            "n_probs": 10,
+            "n_predict": n_predict,
+            "post_sampling_probs": True,
+            "seed": 4242,
+            "backend_sampling": backend_sampling,
+        })
+        assert res.status_code == 200
+
+        total_probs = 0
+        completions = res.body["completion_probabilities"]
+        assert len(completions) == n_predict
+        for tok in completions:
+            # Handling of 0.0 probabilities differs between samplers and backend sampling. Filter them to normalize the
+            # data.
+            tok["top_probs"] = [x for x in tok["top_probs"] if x["prob"] > 0.0]
+            total_probs += len(tok["top_probs"])
+        # Verify that we got at least two top probs on average, to ensure the effectiveness of the test.
+        assert total_probs >= 2 * n_predict
+        return completions
+
+    def verify_token(a, b):
+        assert a["id"] == b["id"]
+        assert a["token"] == b["token"]
+        assert a["bytes"] == b["bytes"]
+        assert a["prob"] == pytest.approx(b["prob"], abs=0.01)
+
+    for (a, b) in zip(make_request(True), make_request(False)):
+        verify_token(a, b)
+        assert len(a["top_probs"]) == len(b["top_probs"])
+
+        for (aa, bb) in zip(a["top_probs"], b["top_probs"]):
+            verify_token(aa, bb)
 
 @pytest.mark.parametrize("tokenize,openai_style", [(False, False), (False, True), (True, False), (True, True)])
 def test_logit_bias(tokenize, openai_style):
@@ -548,24 +611,107 @@ def test_logit_bias(tokenize, openai_style):
     assert all(output_text.find(" " + tok + " ") == -1 for tok in exclude)
 
 
-def test_cancel_request():
+def test_cancel_active_request_and_reuse_slot():
     global server
-    server.n_ctx = 4096
-    server.n_predict = -1
-    server.n_slots = 1
+    server.n_ctx = 2048
+    server.n_slots = 2
+    server.server_continuous_batching = True
     server.server_slots = True
+    server.temperature = 0.0
     server.start()
-    # send a request that will take a long time, but cancel it before it finishes
+
+    cancel_response = None
+    executor = None
+    survivor_future = None
     try:
-        server.make_request("POST", "/completion", data={
-            "prompt": "I believe the meaning of life is",
-        }, timeout=0.1)
-    except requests.exceptions.ReadTimeout:
-        pass # expected
-    # make sure the slot is free
-    time.sleep(2)
-    res = server.make_request("GET", "/slots")
-    assert res.body[0]["is_processing"] == False
+        executor = ThreadPoolExecutor(max_workers=1)
+        reference_request = {
+            "prompt": "A reusable slot must answer this deterministic prompt:",
+            "id_slot": 0,
+            "n_predict": 16,
+            "ignore_eos": True,
+            "cache_prompt": False,
+            "return_tokens": True,
+        }
+        reference = server.make_request("POST", "/completion", data=reference_request)
+        assert reference.status_code == 200
+        assert reference.body["id_slot"] == 0
+
+        cancel_request = {
+            "prompt": "This request should remain active until its client disconnects. " * 4,
+            "id_slot": 0,
+            "n_predict": 512,
+            "ignore_eos": True,
+            "cache_prompt": False,
+            "stream": True,
+        }
+        cancel_url = f"http://{server.server_host}:{server.server_port}/completion"
+        cancel_response = requests.post(cancel_url, json=cancel_request, stream=True, timeout=(5, 60))
+        assert cancel_response.status_code == 200
+        cancel_lines = cancel_response.iter_lines(chunk_size=1)
+        first_cancel_chunk = None
+        for line in cancel_lines:
+            if not line.startswith(b"data: ") or line == b"data: [DONE]":
+                continue
+            chunk = json.loads(line[6:])
+            if chunk["tokens_predicted"] > 0:
+                first_cancel_chunk = chunk
+                break
+        assert first_cancel_chunk is not None
+        assert first_cancel_chunk["stop"] is False
+        assert len(first_cancel_chunk["tokens"]) == 1
+        assert first_cancel_chunk["tokens_evaluated"] + cancel_request["n_predict"] < server.n_ctx // server.n_slots
+
+        survivor_request = {
+            "prompt": "This overlapping request must survive another client's cancellation:",
+            "id_slot": 1,
+            "n_predict": 128,
+            "ignore_eos": True,
+            "cache_prompt": False,
+        }
+        survivor_future = executor.submit(server.make_request, "POST", "/completion", survivor_request)
+        deadline = time.time() + 10
+        while True:
+            slots_response = server.make_request("GET", "/slots")
+            slots = {slot["id"]: slot for slot in slots_response.body}
+            if slots[0]["is_processing"] and slots[1]["is_processing"]:
+                break
+            assert time.time() < deadline
+            time.sleep(0.01)
+        cancel_response.close()
+
+        deadline = time.time() + 10
+        while True:
+            slots_response = server.make_request("GET", "/slots")
+            slots = {slot["id"]: slot for slot in slots_response.body}
+            if not slots[0]["is_processing"]:
+                break
+            assert time.time() < deadline
+            time.sleep(0.01)
+
+        survivor = survivor_future.result(timeout=60)
+
+        assert survivor.status_code == 200
+        assert survivor.body["id_slot"] == 1
+        assert survivor.body["stop"] is True
+
+        reused = server.make_request("POST", "/completion", data=reference_request)
+        assert reused.status_code == 200
+        assert reused.body["id_slot"] == 0
+        assert reused.body["tokens"] == reference.body["tokens"]
+        assert reused.body["content"] == reference.body["content"]
+
+        slots_response = server.make_request("GET", "/slots")
+        assert slots_response.status_code == 200
+        assert all(slot["is_processing"] is False for slot in slots_response.body)
+    finally:
+        if cancel_response is not None:
+            cancel_response.close()
+        if survivor_future is not None and not survivor_future.done():
+            server.stop()
+        if executor is not None:
+            executor.shutdown(wait=True, cancel_futures=True)
+        server.stop()
 
 
 # this test exercises the host-memory prompt cache

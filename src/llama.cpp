@@ -1,6 +1,7 @@
 #include "llama.h"
 
 #include "llama-impl.h"
+#include "llama-version.h"
 
 #include "llama-chat.h"
 #include "llama-context.h"
@@ -13,11 +14,8 @@
 #include "ggml.h"
 #include "ggml-cpp.h"
 #include "ggml-backend.h"
+#include "../ggml/src/ggml-backend-moe.h"
 #include "gguf.h"
-
-#ifdef GGML_USE_CUDA
-#include "ggml-cuda.h"
-#endif
 
 #include <algorithm>
 #include <cassert>
@@ -28,6 +26,7 @@
 #include <cstring>
 #include <ctime>
 #include <stdexcept>
+#include <unordered_set>
 #include <vector>
 
 #if defined(_MSC_VER)
@@ -48,6 +47,34 @@ const char * llama_flash_attn_type_name(enum llama_flash_attn_type flash_attn_ty
             return "enabled";
     }
     GGML_ABORT("fatal error");
+}
+
+const char * llama_load_mode_name(enum llama_load_mode load_mode) {
+    switch (load_mode) {
+        case LLAMA_LOAD_MODE_AUTO:
+            return "auto";
+        case LLAMA_LOAD_MODE_NONE:
+            return "none";
+        case LLAMA_LOAD_MODE_MMAP:
+            return "mmap";
+        case LLAMA_LOAD_MODE_MLOCK:
+            return "mlock";
+        case LLAMA_LOAD_MODE_MMAP_MLOCK:
+            return "mmap+mlock";
+        case LLAMA_LOAD_MODE_DIRECT_IO:
+            return "dio";
+    }
+    GGML_ABORT("fatal error");
+}
+
+enum llama_load_mode llama_load_mode_from_str(const char * str) {
+    if (std::strcmp(str, "auto")       == 0) { return LLAMA_LOAD_MODE_AUTO;       }
+    if (std::strcmp(str, "none")       == 0) { return LLAMA_LOAD_MODE_NONE;       }
+    if (std::strcmp(str, "mmap")       == 0) { return LLAMA_LOAD_MODE_MMAP;       }
+    if (std::strcmp(str, "mlock")      == 0) { return LLAMA_LOAD_MODE_MLOCK;      }
+    if (std::strcmp(str, "mmap+mlock") == 0) { return LLAMA_LOAD_MODE_MMAP_MLOCK; }
+    if (std::strcmp(str, "dio")        == 0) { return LLAMA_LOAD_MODE_DIRECT_IO;  }
+    throw std::invalid_argument(std::string("unknown load mode: ") + str);
 }
 
 struct llama_sampler_chain_params llama_sampler_chain_default_params() {
@@ -75,13 +102,23 @@ bool llama_supports_mlock(void) {
 }
 
 bool llama_supports_gpu_offload(void) {
+    if (!ggml_backend_reg_count()) {
+        ggml_backend_load_all();
+    }
     return ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU) != nullptr ||
            ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_IGPU) != nullptr ||
            llama_supports_rpc();
 }
 
 bool llama_supports_rpc(void) {
+    if (!ggml_backend_reg_count()) {
+        ggml_backend_load_all();
+    }
     return ggml_backend_reg_by_name("RPC") != nullptr;
+}
+
+const char * llama_version(void) {
+    return LLAMA_VERSION;
 }
 
 void llama_backend_init(void) {
@@ -223,7 +260,13 @@ static bool llama_prepare_model_devices(const llama_model_params & params, llama
                     }
 
                     case GGML_BACKEND_DEVICE_TYPE_IGPU:
-                        igpus.push_back({false, dev});
+                        // igpus.empty() - workaround for integrated devices seen by multiple backends
+                        // ref: https://github.com/ggml-org/llama.cpp/pull/23897
+                        // ggml_backend_dev_backend_reg - allow devices of the same backend regardless if integrated
+                        // ref: https://github.com/ggml-org/llama.cpp/pull/23897#issuecomment-5264222997
+                        if (igpus.empty() || ggml_backend_dev_backend_reg(dev) == ggml_backend_dev_backend_reg(igpus.back().dev)) {
+                            igpus.push_back({false, dev});
+                        }
                         break;
                     case GGML_BACKEND_DEVICE_TYPE_META:
                         GGML_ABORT("fatal error");
@@ -237,14 +280,15 @@ static bool llama_prepare_model_devices(const llama_model_params & params, llama
         // add GPUs
         model->devices.insert(model->devices.end(), gpus.begin(), gpus.end());
 
-        // add integrated GPUs only if no other devices were found
-        if (model->devices.empty()) {
+        // add integrated GPUs only if no discrete GPUs were found
+        // (RPC servers do not count, otherwise the local iGPU would be dropped on iGPU+RPC setups)
+        if (gpus.empty()) {
             model->devices.insert(model->devices.end(), igpus.begin(), igpus.end());
         }
     }
 
     // if using single GPU mode, remove all except the main GPU
-    if (params.split_mode == LLAMA_SPLIT_MODE_NONE) {
+    if (params.split_mode == LLAMA_SPLIT_MODE_NONE && !model->devices.empty()) {
         if (params.main_gpu < 0) {
             model->devices.clear();
         } else {
@@ -274,45 +318,137 @@ static bool llama_prepare_model_devices(const llama_model_params & params, llama
 static std::pair<int, llama_model *> llama_model_load(struct gguf_context * metadata, llama_model_set_tensor_data_t set_tensor_data, void * set_tensor_data_ud,
         const std::string & fname, std::vector<std::string> & splits, FILE * file, llama_model_params & params) {
     try {
-        // If the user enabled the MoE expert cache (--moe-expert-cache-size > 0)
-        // and CUDA is available, *prepend* a tensor_buft_override that routes
-        // every expert tensor to the CUDA_MoE_Cached buffer type. Prepending
-        // matters because the loader's match loop is first-match-wins -- we
-        // need the cache override to catch expert tensors before any earlier
-        // --cpu-moe / --n-cpu-moe overrides do. The vector owns the storage
-        // for the duration of this function, which outlives the loader's use
-        // of the pointer.
+        // Legacy slot mode keeps its first-match cache override. An explicit
+        // layer selector opts into residual placement: user overrides win and
+        // the cache catches only the selected layers left over.
         std::vector<llama_model_tensor_buft_override> effective_overrides;
+        std::vector<uint32_t> effective_override_origins;
+        std::vector<std::string> moe_layer_patterns;
+        struct moe_buffer_type_owner {
+            ggml_backend_buffer_type_t type = nullptr;
+            ggml_backend_moe_cache_free_buffer_type_t release = nullptr;
+            ~moe_buffer_type_owner() {
+                if (type != nullptr) {
+                    release(type);
+                }
+            }
+        } moe_buffer_type;
         const llama_model_tensor_buft_override * effective_overrides_ptr = params.tensor_buft_overrides;
-#ifdef GGML_USE_CUDA
-        if (params.moe_expert_cache_slots > 0) {
-            // Tell ggml-cuda how big the LRU slot pool should be so the
-            // dispatch hook can lazy-init the per-device cache on first use.
-            ggml_backend_cuda_moe_set_cache_slots(params.moe_expert_cache_slots);
+        const uint32_t * effective_override_origins_ptr = nullptr;
+        if ((params.moe_expert_cache_byte_budgets == nullptr) !=
+                (params.n_moe_expert_cache_byte_budgets == 0)) {
+            throw std::runtime_error("invalid MoE cache byte budgets");
+        }
+        const bool byte_budget_mode = params.n_moe_expert_cache_byte_budgets != 0;
+        const bool cache_enabled = params.moe_expert_cache_slots > 0 || byte_budget_mode;
+        if (byte_budget_mode && params.moe_expert_cache_slots > 0) {
+            throw std::runtime_error("MoE cache byte budgets conflict with a nonzero slot count");
+        }
+        if (params.moe_expert_cache_host_pinned_size > 0 && !cache_enabled) {
+            throw std::runtime_error("--moe-expert-cache-host-pinned-mb requires an enabled MoE expert cache");
+        }
+        if (params.n_moe_expert_cache_layer_ranges != 0 && params.moe_expert_cache_layer_ranges == nullptr) {
+            throw std::runtime_error("invalid MoE cache layer selector");
+        }
+        if (params.n_moe_expert_cache_layer_ranges != 0 && !cache_enabled) {
+            throw std::runtime_error("MoE cache layer selection requires an enabled MoE expert cache");
+        }
+        if (cache_enabled) {
+            ggml_backend_moe_cache_buffer_type_t buffer_type_fn = nullptr;
+            ggml_backend_reg_t cache_reg = nullptr;
+            for (size_t i = 0; i < ggml_backend_reg_count(); ++i) {
+                ggml_backend_reg_t reg = ggml_backend_reg_get(i);
+                auto candidate_buffer_type_fn = (ggml_backend_moe_cache_buffer_type_t) ggml_backend_reg_get_proc_address(
+                        reg, GGML_BACKEND_MOE_CACHE_BUFFER_TYPE_PROC_NAME);
+                if (candidate_buffer_type_fn != nullptr) {
+                    buffer_type_fn = candidate_buffer_type_fn;
+                    cache_reg = reg;
+                    break;
+                }
+            }
+            if (buffer_type_fn == nullptr) {
+                throw std::runtime_error("--moe-expert-cache-size requires a backend with MoE cache support");
+            }
+            ggml_backend_buffer_type_t buft = buffer_type_fn();
+            if (params.moe_expert_cache_host_pinned_size > 0) {
+                auto create = (ggml_backend_moe_cache_bounded_buffer_type_t) ggml_backend_reg_get_proc_address(
+                    cache_reg, GGML_BACKEND_MOE_CACHE_BOUNDED_BUFFER_TYPE_PROC_NAME);
+                moe_buffer_type.release = (ggml_backend_moe_cache_free_buffer_type_t) ggml_backend_reg_get_proc_address(
+                    cache_reg, GGML_BACKEND_MOE_CACHE_FREE_BUFFER_TYPE_PROC_NAME);
+                moe_buffer_type.type = create != nullptr ? create(params.moe_expert_cache_host_pinned_size) : nullptr;
+                if (moe_buffer_type.release == nullptr || moe_buffer_type.type == nullptr) {
+                    throw std::runtime_error("backend cannot create the bounded MoE host source buffer");
+                }
+                buft = moe_buffer_type.type;
+            }
             // Pattern matches the same expert tensors that --cpu-moe / --n-cpu-moe target.
             // Kept inline (not pulled from common.h) so libllama keeps no common/ dep.
             static const char * MOE_EXPS_PATTERN =
                 "\\.ffn_(up|down|gate|gate_up)_(ch|)exps";
-            effective_overrides.push_back({MOE_EXPS_PATTERN, ggml_backend_cuda_moe_cached_buffer_type()});
-
             bool had_user_overrides = false;
-            if (params.tensor_buft_overrides) {
-                for (const auto * o = params.tensor_buft_overrides; o->pattern != nullptr; ++o) {
-                    effective_overrides.push_back(*o);
-                    had_user_overrides = true;
+            const bool residual = params.n_moe_expert_cache_layer_ranges != 0;
+            const auto append_user_overrides = [&]() {
+                if (params.tensor_buft_overrides) {
+                    for (const auto * o = params.tensor_buft_overrides; o->pattern != nullptr; ++o) {
+                        effective_overrides.push_back(*o);
+                        effective_override_origins.push_back(llama_model_loader::TENSOR_OVERRIDE_USER);
+                        had_user_overrides = true;
+                    }
                 }
+            };
+            if (residual) {
+                append_user_overrides();
+                size_t selected_layers = 0;
+                std::unordered_set<int32_t> unique_layers;
+                for (size_t i = 0; i < params.n_moe_expert_cache_layer_ranges; ++i) {
+                    const auto & range = params.moe_expert_cache_layer_ranges[i];
+                    const uint64_t count = range.first >= 0 && range.last >= range.first ?
+                        static_cast<uint64_t>(range.last) - static_cast<uint64_t>(range.first) + 1 : 0;
+                    if (count == 0 || count > 4096 - selected_layers) {
+                        throw std::runtime_error("invalid or excessively large MoE cache layer selector");
+                    }
+                    for (uint64_t layer = static_cast<uint64_t>(range.first);
+                            layer <= static_cast<uint64_t>(range.last); ++layer) {
+                        if (!unique_layers.insert(static_cast<int32_t>(layer)).second) {
+                            throw std::runtime_error("MoE cache layer selector contains duplicate layers");
+                        }
+                    }
+                    selected_layers += static_cast<size_t>(count);
+                }
+                moe_layer_patterns.reserve(selected_layers);
+                effective_overrides.reserve(effective_overrides.size() + selected_layers + 1);
+                for (size_t i = 0; i < params.n_moe_expert_cache_layer_ranges; ++i) {
+                    const auto & range = params.moe_expert_cache_layer_ranges[i];
+                    for (uint64_t layer = static_cast<uint64_t>(range.first);
+                            layer <= static_cast<uint64_t>(range.last); ++layer) {
+                        moe_layer_patterns.push_back("blk\\." + std::to_string(layer) + MOE_EXPS_PATTERN);
+                        effective_overrides.push_back({moe_layer_patterns.back().c_str(), buft});
+                        effective_override_origins.push_back(llama_model_loader::TENSOR_OVERRIDE_CACHE_SELECTOR);
+                    }
+                }
+            } else {
+                effective_overrides.push_back({MOE_EXPS_PATTERN, buft});
+                effective_override_origins.push_back(llama_model_loader::TENSOR_OVERRIDE_CACHE_LEGACY);
+                append_user_overrides();
             }
-            if (had_user_overrides) {
+            if (had_user_overrides && !residual) {
                 LLAMA_LOG_WARN("--moe-expert-cache-size is set; expert tensors route through "
                                "the GPU LRU cache regardless of --cpu-moe / --n-cpu-moe.\n");
             }
             effective_overrides.push_back({nullptr, nullptr});
+            if (effective_override_origins.size() + 1 != effective_overrides.size()) {
+                throw std::runtime_error("internal MoE placement provenance mismatch");
+            }
             effective_overrides_ptr = effective_overrides.data();
+            effective_override_origins_ptr = effective_override_origins.data();
         }
-#endif
 
-        llama_model_loader ml(metadata, set_tensor_data, set_tensor_data_ud, fname, splits, file, params.use_mmap, params.use_direct_io,
-            params.check_tensors, params.no_alloc, params.kv_overrides, effective_overrides_ptr);
+        llama_model_loader ml(metadata, set_tensor_data, set_tensor_data_ud, fname, splits, file, params.load_mode,
+            params.check_tensors, params.no_alloc, params.load_mtp, params.kv_overrides, effective_overrides_ptr,
+            effective_override_origins_ptr);
+
+        ml.lazy.mode    = params.lazy_mode;
+        ml.model_shared = params.model_shared;
 
         ml.print_info();
         std::unique_ptr<llama_model> model_ptr(llama_model_create(ml, params));
@@ -342,6 +478,14 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
         } catch(const std::exception & e) {
             throw std::runtime_error("error loading model hyperparameters: " + std::string(e.what()));
         }
+        for (size_t i = 0; i < params.n_moe_expert_cache_layer_ranges; ++i) {
+            const auto & range = params.moe_expert_cache_layer_ranges[i];
+            if (static_cast<uint64_t>(range.last) >= model->hparams.n_layer_all) {
+                throw std::runtime_error(format(
+                    "MoE cache layer selector ends at layer %d, but the model has %u layers",
+                    range.last, model->hparams.n_layer_all));
+            }
+        }
         if (model->arch == LLM_ARCH_CLIP) {
             throw std::runtime_error("CLIP cannot be used as main model, use it with --mmproj instead");
         }
@@ -362,15 +506,39 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
         if (!model->load_tensors(ml)) {
             return {-2, nullptr};
         }
-
-#ifdef GGML_USE_CUDA
-        // Eagerly create one slot pool per observed expert tensor, with
-        // each pool sized to that tensor's exact expert_stride. Each pool
-        // logs as a 'load_tensors:'-style line. No lazy creation later.
-        if (params.moe_expert_cache_slots > 0) {
-            ggml_backend_cuda_moe_preallocate_pools(/*device=*/0);
+        std::unordered_set<std::string> moe_source_names;
+        for (const auto & group : model->moe_sources()) {
+            for (const auto & bank : group.banks) {
+                if (bank.tensor != nullptr) {
+                    moe_source_names.insert(bank.tensor->name);
+                }
+            }
         }
-#endif
+        for (const auto & [tensor_name, resolution] : ml.tensor_override_resolutions) {
+            if (moe_source_names.count(tensor_name) == 0) {
+                continue;
+            }
+            model->record_tensor_override_resolution(
+                tensor_name, resolution.origin, resolution.index, resolution.pattern,
+                resolution.requested_buft, resolution.selected_buft, resolution.resolved_buft,
+                resolution.resolved_owner_canonical_id, resolution.resolved_owner_identity_kind,
+                resolution.resolved_owner_backend, resolution.resolved_is_host);
+        }
+        for (const auto & [tensor_name, borrowed] : ml.borrowed_tensors) {
+            model->record_shared_tensor(
+                tensor_name, borrowed.tensor_bytes, borrowed.type, borrowed.ne, borrowed.nb,
+                borrowed.resolved_buft, borrowed.resolved_class, borrowed.owner_canonical_id,
+                borrowed.owner_identity_kind, borrowed.owner_backend, borrowed.resolved_storage_available,
+                borrowed.current_storage_available, borrowed.storage_provenance);
+        }
+        for (const auto & source : ml.artifact_sources) {
+            model->record_artifact_source(
+                source.file_size, source.modification_time, source.modification_time_available);
+        }
+        const bool uses_mlock = params.load_mode == LLAMA_LOAD_MODE_MLOCK ||
+            params.load_mode == LLAMA_LOAD_MODE_MMAP_MLOCK;
+        model->record_resolved_load_strategy(
+            ml.use_mmap, ml.resolved_direct_io_state(), uses_mlock, ml.lazy.any_resolved());
 
         return {0, model_ptr.release()};
     } catch (const std::exception & err) {
@@ -453,7 +621,7 @@ struct llama_model * llama_model_init_from_user(
     GGML_ASSERT(metadata != nullptr);
     std::string path_model;
     std::vector<std::string> splits = {};
-    params.use_mmap = false;
+    params.load_mode = LLAMA_LOAD_MODE_NONE;
     params.use_extra_bufts = false;
     return llama_model_load_from_file_impl(metadata, set_tensor_data, set_tensor_data_ud, path_model, splits, /*file*/ nullptr, params);
 }
@@ -619,4 +787,3 @@ const char * llama_print_system_info(void) {
 
     return s.c_str();
 }
-
