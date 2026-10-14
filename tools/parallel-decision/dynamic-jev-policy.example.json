@@ -17,6 +17,7 @@
     "gate": { "min_prob": 0.55, "min_margin": 0.15, "min_mass": 0.2, "fields": ["difficulty"] }
   },
   "override_client": false,
+  "on_tools": "skip",
   "escalate_steps": 1,
   "rungs": [
     { "name": "R0", "when": { "difficulty": ["easy"] },   "enable_thinking": false, "system_hint": "Answer directly and concisely." },

@@ -5661,6 +5661,7 @@ const char * const DJ_DEFAULT_POLICY = R"JSON({
     "gate": {"min_prob": 0.55, "min_margin": 0.15, "min_mass": 0.2, "fields": ["difficulty"]}
   },
   "override_client": false,
+  "on_tools": "skip",
   "escalate_steps": 1,
   "rungs": [
     {"name": "R0", "when": {"difficulty": ["easy"]},   "enable_thinking": false, "system_hint": "Answer directly and concisely."},
@@ -5675,6 +5676,7 @@ struct dj_state {
     std::map<size_t, std::pair<json, json>> cache; // hash of the router text -> (decision, gate)
     std::deque<size_t>                      order;
     long long                               routed = 0, cache_hits = 0, failed_open = 0, skipped = 0;
+    long long                               agent_skipped = 0, agent_protected = 0;
     double                                  router_ms = 0.0;
     std::map<std::string, long long>        by_rung;
     std::string                             last_error;
@@ -5702,6 +5704,12 @@ json dj_load_policy(const std::string & path) {
     }
     if (!pol.contains("rungs") || !pol.at("rungs").is_array() || pol.at("rungs").size() == 0) {
         throw std::runtime_error("--dynamic-jev-policy: \"rungs\" must be a non-empty array");
+    }
+    if (pol.contains("on_tools")) {
+        const json & ot = pol.at("on_tools");
+        if (!ot.is_string() || (ot.get<std::string>() != "skip" && ot.get<std::string>() != "protect" && ot.get<std::string>() != "route")) {
+            throw std::runtime_error("--dynamic-jev-policy: \"on_tools\" must be \"skip\", \"protect\" or \"route\"");
+        }
     }
     // the router schema must compile now, so a typo fails at startup and not on the first request
     llama_decision::compile_schema(pol.at("router").at("schema"), "");
@@ -5879,17 +5887,48 @@ std::string dj_clean(const std::string & s) {
     return out;
 }
 
+// an agent request: it offers tools, or it already holds tool results / tool calls
+bool dj_is_agent(const json & body) {
+    if (body.contains("tools") && body.at("tools").is_array() && body.at("tools").size() > 0) {
+        return true;
+    }
+    if (body.contains("messages") && body.at("messages").is_array()) {
+        for (const auto & m : body.at("messages")) {
+            if (!m.is_object()) {
+                continue;
+            }
+            if (m.value("role", std::string()) == "tool" || (m.contains("tool_calls") && m.at("tool_calls").is_array() && m.at("tool_calls").size() > 0)) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+// on_tools "protect": keep the thinking budget, but never turn thinking off, add a hint or cap the answer
+void dj_protect_rung(json & rung) {
+    for (const char * k : { "system_hint", "max_tokens" }) {
+        if (rung.contains(k)) {
+            rung.erase(k);
+        }
+    }
+    if (rung.contains("enable_thinking") && rung.at("enable_thinking").is_boolean() && !rung.at("enable_thinking").get<bool>()) {
+        rung.erase("enable_thinking");
+    }
+}
+
 // Rewrites the chat request in place. Returns the X-Dynamic-Jev header value, or "" when the request was left alone.
 // Per request: "dynamic_jev": false skips the router; "dynamic_jev": {"force_rung": "R1"} skips it and uses that rung.
 std::string dj_route(dj_state & st, json & body, const std::function<bool(const json &, json &)> & run_decision) {
     try {
         bool        off = false;
-        std::string forced_rung;
+        std::string forced_rung, tools_req;
         if (body.contains("dynamic_jev")) {
             const json ctl = body.at("dynamic_jev"); // a copy: the key is erased below
             off = ctl.is_boolean() && !ctl.get<bool>();
             if (ctl.is_object()) {
                 forced_rung = ctl.value("force_rung", std::string());
+                tools_req   = ctl.value("on_tools", std::string());
             }
             body.erase("dynamic_jev");
         }
@@ -5902,6 +5941,17 @@ std::string dj_route(dj_state & st, json & body, const std::function<bool(const 
         {
             std::lock_guard<std::mutex> lock(st.mtx);
             pol = st.policy;
+        }
+        std::string  tools_mode     = tools_req.empty() ? pol.value("on_tools", std::string("skip")) : tools_req;
+        if (tools_mode != "skip" && tools_mode != "protect" && tools_mode != "route") {
+            throw std::invalid_argument("on_tools \"" + tools_mode + "\" must be skip, protect or route");
+        }
+        const bool   agent          = dj_is_agent(body);
+        if (agent && tools_mode == "skip" && forced_rung.empty()) {
+            std::lock_guard<std::mutex> lock(st.mtx);
+            st.skipped++;
+            st.agent_skipped++;
+            return "skipped=agent; on_tools=skip";
         }
         json         rungs          = pol.at("rungs");
         const bool   override_client = pol.value("override_client", false);
@@ -5984,12 +6034,19 @@ std::string dj_route(dj_state & st, json & body, const std::function<bool(const 
         }
 
         json        rung = rungs.at(idx);
+        const bool  protect = agent && tools_mode == "protect";
+        if (protect) {
+            dj_protect_rung(rung);
+        }
         std::string set, kept;
         dj_apply_rung(body, rung, override_client, set, kept);
         const std::string name = rung.value("name", std::string("R") + std::to_string(idx));
 
         std::string tag = "rung=" + dj_clean(name) + answer + "; escalated=" + (escalated ? "1" : "0") +
                           "; router_ms=" + std::to_string((long long) ms) + "; cached=" + (from_cache ? "1" : "0");
+        if (agent) {
+            tag += "; agent=" + tools_mode;
+        }
         if (!set.empty()) {
             tag += "; set=" + set;
         }
@@ -5999,6 +6056,9 @@ std::string dj_route(dj_state & st, json & body, const std::function<bool(const 
         {
             std::lock_guard<std::mutex> lock(st.mtx);
             st.routed++;
+            if (protect) {
+                st.agent_protected++;
+            }
             st.router_ms += ms;
             st.by_rung[name]++;
         }
@@ -6359,6 +6419,8 @@ void server_routes::init_routes() {
             st["cache_hits"]    = dj->cache_hits;
             st["failed_open"]   = dj->failed_open;
             st["skipped"]       = dj->skipped;
+            st["agent_skipped"]   = dj->agent_skipped;
+            st["agent_protected"] = dj->agent_protected;
             st["router_ms_avg"] = dj->routed > 0 ? dj->router_ms / (double) dj->routed : 0.0;
             st["last_error"]    = dj->last_error;
             json by = json::object();

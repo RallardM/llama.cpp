@@ -24,11 +24,21 @@ If the model's chat template has no thinking mode, `enable_thinking` and `reason
 - `"dynamic_jev": false`: skip the router for this request.
 - `"dynamic_jev": {"force_rung": "R1"}`: skip the router and use that rung. An unknown name fails open.
 
+## Agent requests (tools)
+
+A request is an agent request when it has a non-empty `tools` list, or its messages hold a `tool` role or `tool_calls`. Policy key `on_tools` decides what to do with it (default `"skip"`):
+
+- `"skip"`: leave the request untouched. Header `skipped=agent; on_tools=skip`. Counters `skipped` and `agent_skipped`.
+- `"protect"`: route, but never turn thinking off, add a system hint or cap the answer, so the model can still emit tool calls. Header carries `agent=protect`. Counter `agent_protected`.
+- `"route"`: route exactly like plain chat (the old behaviour).
+
+Per request: `"dynamic_jev": {"on_tools": "protect"}` overrides the policy. `force_rung` still applies to agent requests in every mode. Compare the three modes on your harness benchmark and keep the best.
+
 ## Seeing what happened
 
 - Response header `X-Dynamic-Jev`, for example `rung=R1; difficulty=medium; kind=code; escalated=0; router_ms=412; cached=0; set=enable_thinking,reasoning_budget_tokens; client_wins=max_tokens`.
 - Server log line `dynamic-jev: ...` for every routed request.
-- `GET /dynamic-jev`: the policy in use and counters (`routed`, `cache_hits`, `failed_open`, `skipped`, `router_ms_avg`, `by_rung`, `last_error`). If `routed` stays 0 while a client runs, the client is not reaching `/v1/chat/completions` or the server was started without the flag.
+- `GET /dynamic-jev`: the policy in use and counters (`routed`, `cache_hits`, `failed_open`, `skipped`, `agent_skipped`, `agent_protected`, `router_ms_avg`, `by_rung`, `last_error`). If `routed` stays 0 while a client runs, the client is not reaching `/v1/chat/completions` or the server was started without the flag.
 
 ## Limits
 

@@ -2,7 +2,7 @@
 """HTTP end-to-end test for /v1/decision, slot mode and the --dynamic-jev chat route.
 
 Start the server first, with the test policy:
-  llama-server -m MODEL.gguf -c 2048 -np 1 --decision-seqs 12 --dynamic-jev-policy tools/parallel-decision/tests/dynamic-jev-policy.test.json --port 8099
+  llama-server -m MODEL.gguf -c 2048 -np 1 --decision-seqs 12 --jinja --dynamic-jev-policy tools/parallel-decision/tests/dynamic-jev-policy.test.json --port 8099
 Then:  python tools/parallel-decision/tests/test_http.py http://127.0.0.1:8099
 
 Works with any model: it checks plumbing and contracts, not answer quality.
@@ -147,10 +147,26 @@ if enabled:
     st, h, r2 = call("POST", "/v1/chat/completions", dict(CHAT))
     check("cached=1" in (h.get("X-Dynamic-Jev") or ""), "the same request again reuses the router answer (cached=1)")
 
+    TOOLS = [{"type": "function", "function": {"name": "get_time", "description": "Get the time", "parameters": {"type": "object", "properties": {}}}}]
+    st, h, r = call("POST", "/v1/chat/completions", dict(CHAT, tools=TOOLS))
+    tag = h.get("X-Dynamic-Jev") or ""
+    check(st == 200 and "skipped=agent" in tag, "on_tools default (skip): a request with tools is not routed -> '%s'" % tag)
+
+    st, h, r = call("POST", "/v1/chat/completions", dict(CHAT, tools=TOOLS, dynamic_jev={"force_rung": "R0", "on_tools": "protect"}))
+    tag = h.get("X-Dynamic-Jev") or ""
+    check(st == 200 and "agent=protect" in tag and "max_tokens" not in tag and "system_hint" not in tag and "enable_thinking" not in tag, "on_tools protect: R0 loses cap, hint and thinking-off -> '%s'" % tag)
+
+    st, h, r = call("POST", "/v1/chat/completions", dict(CHAT, tools=TOOLS, dynamic_jev={"force_rung": "R0", "on_tools": "route"}))
+    tag = h.get("X-Dynamic-Jev") or ""
+    check(st == 200 and "agent=route" in tag and "system_hint" in tag, "on_tools route: the rung applies as for plain chat -> '%s'" % tag)
+
+    st, h, r = call("POST", "/v1/chat/completions", dict(CHAT, dynamic_jev={"on_tools": "bogus"}))
+    check(st == 200 and h.get("X-Dynamic-Jev") is None, "a bad on_tools value fails open")
+
     st, _, s = call("GET", "/dynamic-jev")
     stats = (s or {}).get("stats", {})
-    check(stats.get("routed", 0) >= 4 and sum(stats.get("by_rung", {}).values()) == stats.get("routed"), "stats count routed requests per rung: %s" % json.dumps(stats.get("by_rung")))
-    check(stats.get("failed_open", 0) >= 1 and "NOPE" in str(stats.get("last_error", "")), "stats record the fail-open (last_error: %s)" % stats.get("last_error"))
+    check(stats.get("routed", 0) >= 6 and sum(stats.get("by_rung", {}).values()) == stats.get("routed"), "stats count routed requests per rung: %s" % json.dumps(stats.get("by_rung")))
+    check(stats.get("failed_open", 0) >= 2 and ("NOPE" in str(stats.get("last_error", "")) or "bogus" in str(stats.get("last_error", ""))), "stats record the fail-open (last_error: %s)" % stats.get("last_error"))
 
 print()
 print("ALL %s CHECKS PASSED" % "HTTP" if not FAILS else "%d CHECK(S) FAILED:\n  - %s" % (len(FAILS), "\n  - ".join(FAILS)))
