@@ -5658,6 +5658,7 @@ const char * const DJ_DEFAULT_POLICY = R"JSON({
     },
     "instructions": "Classify the user's request.",
     "max_chars": 4000,
+    "strip_tags": ["system-reminder"],
     "gate": {"min_prob": 0.55, "min_margin": 0.15, "min_mass": 0.2, "fields": ["difficulty"]}
   },
   "override_client": false,
@@ -5732,15 +5733,34 @@ std::string dj_message_text(const json & content) {
     return out;
 }
 
-// the last user message that holds text
-std::string dj_last_user_text(const json & body) {
+// removes <tag>...</tag> blocks (a missing closing tag removes up to the end of the text); harnesses inject
+// such blocks (for example <system-reminder>) as user messages, and they are not the user's request
+std::string dj_strip_tags(std::string t, const std::vector<std::string> & tags) {
+    for (const auto & tag : tags) {
+        const std::string open = "<" + tag + ">", close = "</" + tag + ">";
+        size_t at;
+        while ((at = t.find(open)) != std::string::npos) {
+            const size_t end = t.find(close, at + open.size());
+            t.erase(at, end == std::string::npos ? std::string::npos : end + close.size() - at);
+        }
+    }
+    const size_t first = t.find_first_not_of(" \t\r\n");
+    if (first == std::string::npos) {
+        return "";
+    }
+    const size_t last = t.find_last_not_of(" \t\r\n");
+    return t.substr(first, last - first + 1);
+}
+
+// the last user message that still holds text after the harness tags are stripped
+std::string dj_last_user_text(const json & body, const std::vector<std::string> & strip_tags) {
     std::string last;
     if (!body.contains("messages") || !body.at("messages").is_array()) {
         return last;
     }
     for (const auto & m : body.at("messages")) {
         if (m.is_object() && m.value("role", std::string()) == "user" && m.contains("content")) {
-            const std::string t = dj_message_text(m.at("content"));
+            const std::string t = dj_strip_tags(dj_message_text(m.at("content")), strip_tags);
             if (!t.empty()) {
                 last = t;
             }
@@ -5907,6 +5927,8 @@ std::string dj_peek(const std::string & s, size_t n, bool from_end) {
     for (char & c : out) {
         if (static_cast<unsigned char>(c) < 0x20 || c == '"') {
             c = ' ';
+        } else if (static_cast<unsigned char>(c) >= 0x80) {
+            c = '?';
         }
     }
     return out;
@@ -6014,7 +6036,16 @@ std::string dj_route(dj_state & st, json & body, const std::function<bool(const 
             answer = "; forced=1";
         } else {
             const json        router = pol.at("router");
-            const std::string text   = dj_clip(dj_last_user_text(body), (size_t) router.value("max_chars", 4000));
+            std::vector<std::string> strip_tags = { "system-reminder" };
+            if (router.contains("strip_tags") && router.at("strip_tags").is_array()) {
+                strip_tags.clear();
+                for (const auto & t : router.at("strip_tags")) {
+                    if (t.is_string()) {
+                        strip_tags.push_back(t.get<std::string>());
+                    }
+                }
+            }
+            const std::string text   = dj_clip(dj_last_user_text(body, strip_tags), (size_t) router.value("max_chars", 4000));
             if (text.empty()) {
                 std::lock_guard<std::mutex> lock(st.mtx);
                 st.skipped++;
