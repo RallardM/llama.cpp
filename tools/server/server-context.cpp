@@ -5659,10 +5659,12 @@ const char * const DJ_DEFAULT_POLICY = R"JSON({
     "instructions": "Classify the user's request.",
     "max_chars": 4000,
     "strip_tags": ["system-reminder"],
+    "skip_prefixes": ["Current runtime context."],
     "gate": {"min_prob": 0.55, "min_margin": 0.15, "min_mass": 0.2, "fields": ["difficulty"]}
   },
   "override_client": false,
   "on_tools": "skip",
+  "task_pick": "last",
   "escalate_steps": 1,
   "rungs": [
     {"name": "R0", "when": {"difficulty": ["easy"]},   "enable_thinking": false, "system_hint": "Answer directly and concisely."},
@@ -5712,6 +5714,12 @@ json dj_load_policy(const std::string & path) {
             throw std::runtime_error("--dynamic-jev-policy: \"on_tools\" must be \"skip\", \"protect\" or \"route\"");
         }
     }
+    if (pol.contains("task_pick")) {
+        const json & tp = pol.at("task_pick");
+        if (!tp.is_string() || (tp.get<std::string>() != "last" && tp.get<std::string>() != "first")) {
+            throw std::runtime_error("--dynamic-jev-policy: \"task_pick\" must be \"last\" or \"first\"");
+        }
+    }
     // the router schema must compile now, so a typo fails at startup and not on the first request
     llama_decision::compile_schema(pol.at("router").at("schema"), "");
     return pol;
@@ -5728,6 +5736,33 @@ std::string dj_message_text(const json & content) {
                 out += part.value("text", std::string());
                 out += "\n";
             }
+        }
+    }
+    return out;
+}
+
+// log-safe preview of a text: at most n bytes from the front (or the back), cut on a UTF-8 boundary, control chars as spaces
+std::string dj_peek(const std::string & s, size_t n, bool from_end) {
+    size_t a = 0, b = s.size();
+    if (s.size() > n) {
+        if (from_end) {
+            a = s.size() - n;
+            while (a < s.size() && (static_cast<unsigned char>(s[a]) & 0xC0) == 0x80) {
+                ++a;
+            }
+        } else {
+            b = n;
+            while (b > 0 && (static_cast<unsigned char>(s[b]) & 0xC0) == 0x80) {
+                --b;
+            }
+        }
+    }
+    std::string out = s.substr(a, b - a);
+    for (char & c : out) {
+        if (static_cast<unsigned char>(c) < 0x20 || c == '"') {
+            c = ' ';
+        } else if (static_cast<unsigned char>(c) >= 0x80) {
+            c = '?';
         }
     }
     return out;
@@ -5752,21 +5787,43 @@ std::string dj_strip_tags(std::string t, const std::vector<std::string> & tags) 
     return t.substr(first, last - first + 1);
 }
 
-// the last user message that still holds text after the harness tags are stripped
-std::string dj_last_user_text(const json & body, const std::vector<std::string> & strip_tags) {
-    std::string last;
+// the user message to route on. Harness tags are stripped, messages starting with a skip prefix are ignored
+// (harnesses inject runtime-context messages as user turns); then the last one (plain chat) or the first one
+// (pick_first, for agent requests where the first user turn is the task) is used. report lists every user message.
+std::string dj_last_user_text(const json & body, const std::vector<std::string> & strip_tags, const std::vector<std::string> & skip_prefixes,
+                              bool pick_first, std::string * report = nullptr) {
+    std::string chosen;
+    bool        have = false;
     if (!body.contains("messages") || !body.at("messages").is_array()) {
-        return last;
+        return chosen;
     }
+    size_t idx = 0;
     for (const auto & m : body.at("messages")) {
-        if (m.is_object() && m.value("role", std::string()) == "user" && m.contains("content")) {
-            const std::string t = dj_strip_tags(dj_message_text(m.at("content")), strip_tags);
-            if (!t.empty()) {
-                last = t;
+        if (!m.is_object() || m.value("role", std::string()) != "user" || !m.contains("content")) {
+            continue;
+        }
+        const std::string raw = dj_message_text(m.at("content"));
+        const std::string t   = dj_strip_tags(raw, strip_tags);
+        bool skip = t.empty();
+        for (const auto & pre : skip_prefixes) {
+            if (!pre.empty() && t.compare(0, pre.size(), pre) == 0) {
+                skip = true;
             }
         }
+        if (report) {
+            *report += " [user#" + std::to_string(idx) + " raw=" + std::to_string(raw.size()) + " kept=" + std::to_string(t.size()) +
+                       (skip ? " SKIP" : " ok") + " \"" + dj_peek(t, 60, false) + "\"]";
+        }
+        ++idx;
+        if (skip) {
+            continue;
+        }
+        if (!have || !pick_first) {
+            chosen = t;
+            have   = true;
+        }
     }
-    return last;
+    return chosen;
 }
 
 // keep the beginning (the task) and the end (the format rules) of a long request, cut on UTF-8 boundaries
@@ -5907,33 +5964,6 @@ std::string dj_clean(const std::string & s) {
     return out;
 }
 
-// log-safe preview of a text: at most n bytes from the front (or the back), cut on a UTF-8 boundary, control chars as spaces
-std::string dj_peek(const std::string & s, size_t n, bool from_end) {
-    size_t a = 0, b = s.size();
-    if (s.size() > n) {
-        if (from_end) {
-            a = s.size() - n;
-            while (a < s.size() && (static_cast<unsigned char>(s[a]) & 0xC0) == 0x80) {
-                ++a;
-            }
-        } else {
-            b = n;
-            while (b > 0 && (static_cast<unsigned char>(s[b]) & 0xC0) == 0x80) {
-                --b;
-            }
-        }
-    }
-    std::string out = s.substr(a, b - a);
-    for (char & c : out) {
-        if (static_cast<unsigned char>(c) < 0x20 || c == '"') {
-            c = ' ';
-        } else if (static_cast<unsigned char>(c) >= 0x80) {
-            c = '?';
-        }
-    }
-    return out;
-}
-
 // how many user messages hold text
 size_t dj_user_msgs(const json & body) {
     size_t n = 0;
@@ -6036,16 +6066,22 @@ std::string dj_route(dj_state & st, json & body, const std::function<bool(const 
             answer = "; forced=1";
         } else {
             const json        router = pol.at("router");
-            std::vector<std::string> strip_tags = { "system-reminder" };
-            if (router.contains("strip_tags") && router.at("strip_tags").is_array()) {
-                strip_tags.clear();
-                for (const auto & t : router.at("strip_tags")) {
-                    if (t.is_string()) {
-                        strip_tags.push_back(t.get<std::string>());
+            auto str_list = [&](const char * key, std::vector<std::string> def) {
+                if (router.contains(key) && router.at(key).is_array()) {
+                    def.clear();
+                    for (const auto & t : router.at(key)) {
+                        if (t.is_string()) {
+                            def.push_back(t.get<std::string>());
+                        }
                     }
                 }
-            }
-            const std::string text   = dj_clip(dj_last_user_text(body, strip_tags), (size_t) router.value("max_chars", 4000));
+                return def;
+            };
+            const std::vector<std::string> strip_tags    = str_list("strip_tags", { "system-reminder" });
+            const std::vector<std::string> skip_prefixes = str_list("skip_prefixes", { "Current runtime context." });
+            const bool                     pick_first    = agent && pol.value("task_pick", std::string("last")) == "first";
+            std::string                    report;
+            const std::string text = dj_clip(dj_last_user_text(body, strip_tags, skip_prefixes, pick_first, &report), (size_t) router.value("max_chars", 4000));
             if (text.empty()) {
                 std::lock_guard<std::mutex> lock(st.mtx);
                 st.skipped++;
@@ -6064,6 +6100,9 @@ std::string dj_route(dj_state & st, json & body, const std::function<bool(const 
                     from_cache = true;
                     st.cache_hits++;
                 }
+            }
+            if (!from_cache && agent) {
+                SRV_INF("dynamic-jev: agent request, user messages:%s (pick=%s)\n", report.c_str(), pick_first ? "first" : "last");
             }
             if (!from_cache) {
                 json req = json::object();

@@ -14,10 +14,13 @@
     },
     "instructions": "Classify the user's request.",
     "max_chars": 4000,
+    "strip_tags": ["system-reminder"],
+    "skip_prefixes": ["Current runtime context."],
     "gate": { "min_prob": 0.55, "min_margin": 0.15, "min_mass": 0.2, "fields": ["difficulty"] }
   },
   "override_client": false,
   "on_tools": "skip",
+  "task_pick": "last",
   "escalate_steps": 1,
   "rungs": [
     { "name": "R0", "when": { "difficulty": ["easy"] },   "enable_thinking": false, "system_hint": "Answer directly and concisely." },

@@ -9,7 +9,7 @@ Clients such as benchmark harnesses and agents call `/v1/chat/completions`. The 
 
 ## What happens to a chat request
 
-1. The last user message is clipped (first two thirds and last third of `max_chars`, default 4000) and sent to the decision engine with the policy's router schema. The router answers, for example, `difficulty` and `kind`, with confidence signals.
+1. The last user message is first cleaned of harness blocks (`router.strip_tags`, default `["system-reminder"]`: every `<tag>...</tag>` is removed; a user message left empty, or starting with one of `router.skip_prefixes` (default `["Current runtime context."]`), is ignored; `task_pick` (top-level, `"last"` default or `"first"`) says which remaining user message is routed on for agent requests, where the first user turn is usually the task; if no user text is left the request is not routed). The text is then clipped (first two thirds and last third of `max_chars`, default 4000) and sent to the decision engine with the policy's router schema. The router answers, for example, `difficulty` and `kind`, with confidence signals.
 2. The first rung whose `when` matches the answer is chosen. Rungs run from lowest to highest. If the router's gate fires (low probability, margin or mass), the request moves up `escalate_steps` rungs.
 3. The rung sets, on the request: `enable_thinking`, `reasoning_budget_tokens` (-1 = unlimited), `max_tokens`, and `system_hint` (added to the system message).
 4. What the client already set wins, unless the policy says `"override_client": true`.
